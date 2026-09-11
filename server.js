@@ -41,7 +41,6 @@ async function db(query, params = []) {
 ========================= */
 
 async function initDatabase() {
-  await db("DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='job_audio_chunks' AND column_name='audio') THEN ALTER TABLE job_audio_chunks ALTER COLUMN audio DROP NOT NULL; END IF; END $$;");
   console.log("Starting PostgreSQL database initialization...");
 
   await db(`
@@ -192,26 +191,6 @@ async function initDatabase() {
   await db(`
     ALTER TABLE job_audio_chunks
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
-  `);
-
-  /* =========================
-     LEGACY AUDIO COLUMN FIX
-  ========================= */
-
-  await db(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'job_audio_chunks'
-          AND column_name = 'audio'
-      ) THEN
-        ALTER TABLE job_audio_chunks
-        ALTER COLUMN audio DROP NOT NULL;
-      END IF;
-    END $$;
   `);
 
   /* =========================
@@ -522,126 +501,129 @@ Requirements:
 
   for (const model of SCRIPT_MODELS) {
     try {
+      console.log(
+        `Generating script with model: ${model}`
+      );
+
       const result = await retryGemini(
         model,
         {
           contents: [
             {
               role: "user",
-              parts: [{ text: prompt }],
+              parts: [
+                {
+                  text: prompt,
+                },
+              ],
             },
           ],
-          generationConfig: {
-            temperature: 0.8,
-            maxOutputTokens: 3000,
-          },
         },
-        45000,
+        60000,
         2
       );
 
-      const text = result?.candidates?.[0]?.content?.parts
-        ?.map((part) => part.text || "")
-        .join("")
-        .trim();
+      const text =
+        result?.candidates?.[0]?.content?.parts
+          ?.map(part => part?.text || "")
+          .join("")
+          .trim();
 
-      if (text) {
-        return {
-          script: text,
-          model,
-        };
+      if (!text) {
+        throw new Error(
+          "Gemini returned empty script"
+        );
       }
-    } catch (error) {
-      console.log(
-        `Script model failed: ${model}: ${error.message}`
-      );
 
+      return text;
+    } catch (error) {
       lastError = error;
+
+      console.error(
+        `Script generation failed: model=${model}, error=${error.message}`
+      );
     }
   }
 
   throw lastError ||
     new Error("All script models failed");
-}
-
+    }
 /* =========================
-   QUALITY CHECK
+   SCRIPT QUALITY CHECK
 ========================= */
 
-function qualityCheck(script) {
+function qualityCheckScript(script) {
+  if (!script || !script.trim()) {
+    return {
+      passed: false,
+      reason: "Script is empty",
+    };
+  }
+
   const words = script
     .trim()
     .split(/\s+/)
     .filter(Boolean);
 
-  if (words.length < 150) {
-    throw new Error(
-      "Script too short for quality gate"
-    );
+  if (words.length < 300) {
+    return {
+      passed: false,
+      reason: `Script too short: ${words.length} words`,
+    };
   }
 
-  return words.length;
+  const lower = script.toLowerCase();
+
+  const blockedPatterns = [
+    "lorem ipsum",
+    "as an ai language model",
+    "i cannot provide",
+  ];
+
+  const foundBlocked = blockedPatterns.find(
+    item => lower.includes(item)
+  );
+
+  if (foundBlocked) {
+    return {
+      passed: false,
+      reason: `Unwanted phrase detected: ${foundBlocked}`,
+    };
+  }
+
+  return {
+    passed: true,
+    words: words.length,
+  };
 }
 
 /* =========================
-   TTS CHUNKING
+   TEXT CHUNKING
 ========================= */
 
 function splitIntoChunks(
   text,
-  maxWords = 120
+  maxWords = 450
 ) {
-  const clean = String(text || "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!clean) return [];
-
-  const sentences =
-    clean.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ||
-    [clean];
+  const words = text
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
 
   const chunks = [];
+
   let current = [];
 
-  for (const sentence of sentences) {
-    const words = sentence
-      .trim()
-      .split(/\s+/);
+  for (const word of words) {
+    current.push(word);
 
-    if (words.length > maxWords) {
-      if (current.length) {
-        chunks.push(current.join(" "));
-        current = [];
-      }
-
-      for (
-        let i = 0;
-        i < words.length;
-        i += maxWords
-      ) {
-        chunks.push(
-          words
-            .slice(i, i + maxWords)
-            .join(" ")
-        );
-      }
-
-      continue;
-    }
-
-    if (
-      current.length > 0 &&
-      current.length + words.length > maxWords
-    ) {
+    if (current.length >= maxWords) {
       chunks.push(current.join(" "));
       current = [];
     }
-
-    current.push(...words);
   }
 
-  if (current.length) {
+  if (current.length > 0) {
     chunks.push(current.join(" "));
   }
 
@@ -649,271 +631,409 @@ function splitIntoChunks(
 }
 
 /* =========================
-   TTS
-========================= */
-
-async function generateTTSChunk(
-  text,
-  model
-) {
-  const controller = new AbortController();
-
-  const timeoutMs = 120000;
-
-  const timer = setTimeout(
-    () => controller.abort(),
-    timeoutMs
-  );
-
-  try {
-    const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/interactions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY,
-        },
-        body: JSON.stringify({
-          model,
-          input: text,
-          response_format: {
-            type: "audio",
-          },
-          generation_config: {
-            speech_config: [
-              {
-                voice: "Kore",
-              },
-            ],
-          },
-        }),
-        signal: controller.signal,
-      }
-    );
-
-    const raw = await response.text();
-
-    if (!response.ok) {
-      const error = new Error(
-        `TTS ${response.status}: ${raw}`
-      );
-
-      error.status = response.status;
-
-      throw error;
-    }
-
-    const result = JSON.parse(raw);
-
-    const audioData =
-      result?.output_audio?.data;
-
-    if (!audioData) {
-      throw new Error(
-        "TTS returned no audio data"
-      );
-    }
-
-    return {
-      buffer: Buffer.from(
-        audioData,
-        "base64"
-      ),
-      mimeType:
-        result?.output_audio?.mime_type ||
-        "audio/wav",
-      sampleRate:
-        result?.output_audio?.sample_rate ||
-        24000,
-    };
-  } catch (error) {
-    if (error.name === "AbortError") {
-      const e = new Error(
-        `TTS_REQUEST_TIMEOUT_${timeoutMs}MS`
-      );
-
-      e.code = "TIMEOUT";
-
-      throw e;
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-async function generateTTSWithRetry(text) {
-  let lastError;
-  const model=TTS_MODELS[0];
-
-  for(let attempt=1;attempt<=2;attempt++){
-    try{
-      console.log(`TTS request: model=${model}, attempt=${attempt}, words=${text.split(/\s+/).length}`);
-      return {...(await generateTTSChunk(text,model)),model};
-    }catch(error){
-      lastError=error;
-      console.log(`TTS failed: model=${model}, attempt=${attempt}, error=${error.message}`);
-
-      if(error.status===400 || error.status===403 || error.status===429) break;
-
-      if(error.code==="TIMEOUT" || [500,502,503].includes(error.status)){
-        if(attempt<2) await sleep(5000+Math.floor(Math.random()*3000));
-        else break;
-      }else break;
-    }
-  }
-
-  throw lastError || new Error("All TTS models failed");
-}
-
-/* =========================
    WAV HELPERS
 ========================= */
 
 function isWav(buffer) {
-  return (
-    buffer.length >= 12 &&
-    buffer.toString("ascii", 0, 4) === "RIFF" &&
-    buffer.toString("ascii", 8, 12) === "WAVE"
-  );
-}
-
-function pcmToWav(
-  pcm,
-  sampleRate = 24000,
-  channels = 1,
-  bits = 16
-) {
-  const blockAlign =
-    (channels * bits) / 8;
-
-  const byteRate =
-    sampleRate * blockAlign;
-
-  const header = Buffer.alloc(44);
-
-  header.write("RIFF", 0);
-  header.writeUInt32LE(
-    36 + pcm.length,
-    4
-  );
-
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(
-    byteRate,
-    28
-  );
-
-  header.writeUInt16LE(
-    blockAlign,
-    32
-  );
-
-  header.writeUInt16LE(
-    bits,
-    34
-  );
-
-  header.write("data", 36);
-
-  header.writeUInt32LE(
-    pcm.length,
-    40
-  );
-
-  return Buffer.concat([
-    header,
-    pcm,
-  ]);
-}
-
-function getWavPcm(wav) {
-  if (!isWav(wav)) {
-    return wav;
+  if (!Buffer.isBuffer(buffer)) {
+    return false;
   }
 
-  let offset = 12;
+  if (buffer.length < 12) {
+    return false;
+  }
 
-  while (offset + 8 <= wav.length) {
-    const id = wav.toString(
+  const riff =
+    buffer.toString(
       "ascii",
-      offset,
-      offset + 4
+      0,
+      4
     );
 
-    const size = wav.readUInt32LE(
-      offset + 4
+  const wave =
+    buffer.toString(
+      "ascii",
+      8,
+      12
     );
 
-    if (id === "data") {
-      const end = Math.min(
-        offset + 8 + size,
-        wav.length
-      );
-
-      return wav.subarray(
-        offset + 8,
-        end
-      );
-    }
-
-    offset += 8 + size;
-  }
-
-  throw new Error(
-    "WAV data chunk not found"
+  return (
+    riff === "RIFF" &&
+    wave === "WAVE"
   );
 }
 
-function getWavFormat(wav) {
+function concatBuffers(buffers) {
+  return Buffer.concat(
+    buffers.filter(
+      buffer =>
+        Buffer.isBuffer(buffer) &&
+        buffer.length > 0
+    )
+  );
+}
+
+/* =========================
+   FINAL GEMINI TTS
+========================= */
+
+async function generateTTSChunk(
+  text,
+  model = TTS_MODELS[0]
+) {
+  if (!text || !text.trim()) {
+    throw new Error(
+      "TTS text is empty"
+    );
+  }
+
+  console.log(
+    `TTS request: model=${model}, attempt=1, words=${text.trim().split(/\s+/).length}`
+  );
+
+  const response = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/interactions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type":
+          "application/json",
+        "x-goog-api-key":
+          GEMINI_API_KEY,
+      },
+      body: JSON.stringify({
+        model,
+        input: text,
+
+        /*
+         * IMPORTANT:
+         * Audio is requested as an inline
+         * response.
+         */
+        response_format: {
+          type: "audio",
+          mime_type: "audio/wav",
+          delivery: "inline",
+        },
+
+        /*
+         * IMPORTANT:
+         * The current Interactions API expects
+         * speech_config as an array.
+         */
+        generation_config: {
+          speech_config: [
+            {
+              voice: "Kore",
+              language: "en-US",
+            },
+          ],
+        },
+      }),
+    }
+  );
+
+  const raw =
+    await response.text();
+
+  if (!response.ok) {
+    const error =
+      new Error(
+        `TTS HTTP ${response.status}: ${raw}`
+      );
+
+    error.status =
+      response.status;
+
+    throw error;
+  }
+
+  let result;
+
+  try {
+    result = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `TTS returned invalid JSON: ${raw.slice(0, 500)}`
+    );
+  }
+
+  /*
+   * IMPORTANT:
+   *
+   * The raw REST response contains audio
+   * inside outputs[].
+   *
+   * Do NOT use:
+   *
+   * result.output_audio.data
+   *
+   * That is an SDK convenience property,
+   * not the raw REST response structure.
+   */
+  const audioOutput =
+    Array.isArray(result?.outputs)
+      ? result.outputs.find(
+          output =>
+            output?.type === "audio"
+        )
+      : null;
+
+  const audioData =
+    audioOutput?.data;
+
+  if (!audioData) {
+    console.error(
+      "TTS raw response:",
+      JSON.stringify(
+        result
+      ).slice(0, 3000)
+    );
+
+    throw new Error(
+      "TTS returned no audio data in outputs[]"
+    );
+  }
+
+  let buffer;
+
+  try {
+    buffer =
+      Buffer.from(
+        audioData,
+        "base64"
+      );
+  } catch (error) {
+    throw new Error(
+      `TTS audio base64 decode failed: ${error.message}`
+    );
+  }
+
   if (
-    !isWav(wav) ||
-    wav.length < 36
+    !buffer ||
+    buffer.length === 0
   ) {
-    return {
-      sampleRate: 24000,
-      channels: 1,
-      bits: 16,
-    };
+    throw new Error(
+      "TTS audio buffer is empty"
+    );
+  }
+
+  if (!isWav(buffer)) {
+    throw new Error(
+      `TTS returned audio, but it is not a valid WAV file. bytes=${buffer.length}`
+    );
   }
 
   return {
-    sampleRate: wav.readUInt32LE(24),
-    channels: wav.readUInt16LE(22),
-    bits: wav.readUInt16LE(34),
+    buffer,
+    mimeType:
+      audioOutput?.mime_type ||
+      "audio/wav",
+    sampleRate:
+      audioOutput?.sample_rate ||
+      null,
   };
 }
 
-function concatWavBuffers(buffers) {
-  if (!buffers.length) {
-    throw new Error(
-      "No audio buffers to concatenate"
-    );
+/* =========================
+   TTS RETRY
+========================= */
+
+async function generateTTSWithRetry(
+  text
+) {
+  /*
+   * FREE-TIER SAFETY:
+   *
+   * Use only the primary TTS model.
+   *
+   * Do not automatically jump to another
+   * model after quota/auth/request errors.
+   */
+  const model =
+    TTS_MODELS[0];
+
+  let lastError;
+
+  /*
+   * Only transient server/timeout errors
+   * receive a retry.
+   *
+   * 400 / 401 / 403 / 429 are NOT retried.
+   */
+  const maxAttempts = 2;
+
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
+  ) {
+    try {
+      console.log(
+        `TTS request: model=${model}, attempt=${attempt}, words=${text.trim().split(/\s+/).length}`
+      );
+
+      return await generateTTSChunk(
+        text,
+        model
+      );
+    } catch (error) {
+      lastError = error;
+
+      console.error(
+        `TTS failed: model=${model}, attempt=${attempt}, error=${error.message}`
+      );
+
+      const retryable =
+        error.code === "TIMEOUT" ||
+        error.status === 500 ||
+        error.status === 502 ||
+        error.status === 503;
+
+      if (
+        !retryable ||
+        attempt >= maxAttempts
+      ) {
+        throw error;
+      }
+
+      const wait =
+        5000 +
+        Math.floor(
+          Math.random() * 3000
+        );
+
+      console.log(
+        `TTS transient error. Waiting ${wait}ms before retry.`
+      );
+
+      await sleep(wait);
+    }
   }
 
-  const first = isWav(buffers[0])
-    ? buffers[0]
-    : pcmToWav(buffers[0]);
+  throw (
+    lastError ||
+    new Error(
+      "TTS generation failed"
+    )
+  );
+}
 
-  const format = getWavFormat(first);
+/* =========================
+   AUDIO CHUNK DATABASE
+========================= */
 
-  const pcm = Buffer.concat(
-    buffers.map(getWavPcm)
+async function saveAudioChunk(
+  jobId,
+  chunkIndex,
+  audio
+) {
+  await db(
+    `
+      INSERT INTO job_audio_chunks (
+        job_id,
+        chunk_index,
+        audio_data,
+        mime_type,
+        status,
+        model,
+        error,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        'completed',
+        $5,
+        NULL,
+        NOW(),
+        NOW()
+      )
+      ON CONFLICT (
+        job_id,
+        chunk_index
+      )
+      DO UPDATE SET
+        audio_data = EXCLUDED.audio_data,
+        mime_type = EXCLUDED.mime_type,
+        status = 'completed',
+        model = EXCLUDED.model,
+        error = NULL,
+        updated_at = NOW()
+    `,
+    [
+      jobId,
+      chunkIndex,
+      audio.buffer,
+      audio.mimeType,
+      TTS_MODELS[0],
+    ]
+  );
+}
+
+async function markAudioChunkFailed(
+  jobId,
+  chunkIndex,
+  error
+) {
+  await db(
+    `
+      INSERT INTO job_audio_chunks (
+        job_id,
+        chunk_index,
+        status,
+        error,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2,
+        'failed',
+        $3,
+        NOW(),
+        NOW()
+      )
+      ON CONFLICT (
+        job_id,
+        chunk_index
+      )
+      DO UPDATE SET
+        status = 'failed',
+        error = EXCLUDED.error,
+        updated_at = NOW()
+    `,
+    [
+      jobId,
+      chunkIndex,
+      error?.message ||
+        String(error),
+    ]
+  );
+}
+
+async function getCompletedAudioChunks(
+  jobId
+) {
+  const result = await db(
+    `
+      SELECT
+        chunk_index,
+        audio_data,
+        mime_type
+      FROM job_audio_chunks
+      WHERE job_id = $1
+        AND status = 'completed'
+        AND audio_data IS NOT NULL
+      ORDER BY chunk_index ASC
+    `,
+    [jobId]
   );
 
-  return pcmToWav(
-    pcm,
-    format.sampleRate,
-    format.channels,
-    format.bits
-  );
+  return result.rows;
 }
 
 /* =========================
@@ -922,62 +1042,172 @@ function concatWavBuffers(buffers) {
 
 async function getJob(id) {
   const result = await db(
-    `SELECT * FROM jobs WHERE id = $1`,
+    `
+      SELECT *
+      FROM jobs
+      WHERE id = $1
+    `,
     [id]
   );
 
   return result.rows[0] || null;
 }
 
-async function updateJob(id, fields) {
-  const entries =
-    Object.entries(fields);
+async function updateJob(
+  id,
+  fields
+) {
+  const keys =
+    Object.keys(fields);
 
-  if (!entries.length) return;
+  if (!keys.length) {
+    return getJob(id);
+  }
 
-  const allowed = new Set([
-    "topic",
-    "chat_id",
-    "status",
-    "progress",
-    "stage",
-    "script",
-    "error",
-    "tts_total_chunks",
-    "tts_completed_chunks",
-    "tts_current_chunk",
-  ]);
+  const values =
+    Object.values(fields);
 
-  const values = [];
-  const sets = [];
+  const setParts =
+    keys.map(
+      (key, index) =>
+        `"${key}" = $${index + 2}`
+    );
 
-  for (const [key, value] of entries) {
-    if (!allowed.has(key)) {
-      throw new Error(
-        `Invalid job field: ${key}`
-      );
-    }
+  const result =
+    await db(
+      `
+        UPDATE jobs
+        SET
+          ${setParts.join(", ")},
+          updated_at = NOW()
+        WHERE id = $1
+        RETURNING *
+      `,
+      [id, ...values]
+    );
 
-    values.push(value);
+  return result.rows[0] || null;
+}
 
-    sets.push(
-      `${key} = $${values.length}`
+async function createJob(
+  topic,
+  chatId
+) {
+  const id =
+    `job_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+
+  const result =
+    await db(
+      `
+        INSERT INTO jobs (
+          id,
+          topic,
+          chat_id,
+          status,
+          progress,
+          stage
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          'queued',
+          0,
+          'queued'
+        )
+        RETURNING *
+      `,
+      [
+        id,
+        topic,
+        chatId,
+      ]
+    );
+
+  return result.rows[0];
+}
+
+/* =========================
+   SAFE JOB PAUSE
+========================= */
+
+async function pauseJobSafely(
+  jobId,
+  error
+) {
+  const job =
+    await getJob(jobId);
+
+  if (!job) {
+    return null;
+  }
+
+  const message =
+    error?.message ||
+    String(error);
+
+  const updated =
+    await updateJob(
+      jobId,
+      {
+        status: "paused",
+        stage: "paused",
+        error: message,
+      }
+    );
+
+  if (job.chat_id) {
+    await sendMessage(
+      job.chat_id,
+      [
+        "⚠️ JOB PAUSED SAFELY",
+        "",
+        `Job: ${jobId}`,
+        `Reason: ${message}`,
+        "",
+        "Already completed chunks are saved.",
+        "No paid fallback was used.",
+        "",
+        `Resume with: /resume ${jobId}`,
+      ].join("\n")
     );
   }
 
-  values.push(id);
-
-  await db(
-    `
-    UPDATE jobs
-    SET ${sets.join(", ")},
-        updated_at = NOW()
-    WHERE id = $${values.length}
-    `,
-    values
-  );
+  return updated;
 }
 
+/* =========================
+   RESUME JOB
+========================= */
+
+async function resumeJob(
+  jobId
+) {
+  const job =
+    await getJob(jobId);
+
+  if (!job) {
+    throw new Error(
+      `Job not found: ${jobId}`
+    );
+  }
+
+  await updateJob(
+    jobId,
+    {
+      status: "queued",
+      stage: "queued",
+      error: null,
+    }
+  );
+
+  /*
+   * processJob() will inspect already
+   * completed audio chunks and continue
+   * from the missing chunk.
+   */
+  return processJob(jobId);
+}
 /* =========================
    TTS JOB PROCESSOR
 ========================= */
@@ -988,7 +1218,7 @@ async function processTTS(
 ) {
   const chunks = splitIntoChunks(
     job.script,
-    120
+    450
   );
 
   if (!chunks.length) {
@@ -1337,6 +1567,10 @@ Progress: 50%`
     error: null,
   });
 
+  // Refresh after status updates so resume/restart always uses the
+  // latest persisted script and chat_id.
+  job = await getJob(id);
+
   await sendMessage(
     targetChat,
     "🎙️ Generating AI narration\nProgress: 55%"
@@ -1549,7 +1783,6 @@ Total: ${s.total}
 Payment mode: APPROVAL ONLY`
   );
 }
-
 /* =========================
    TELEGRAM WEBHOOK
 ========================= */
@@ -1825,6 +2058,56 @@ async function startup() {
         console.log(
           "STARTUP COMPLETE"
         );
+
+        // Resume jobs that were queued/recovered during a previous
+        // process lifetime. Existing completed TTS chunks are reused.
+        setTimeout(async () => {
+          try {
+            const queued = await db(`
+              SELECT id, chat_id
+              FROM jobs
+              WHERE status = 'queued'
+              ORDER BY created_at ASC
+              LIMIT 10
+            `);
+
+            for (const row of queued.rows) {
+              processJob(
+                row.id,
+                row.chat_id
+              ).catch(async (error) => {
+
+                await updateJob(
+                  row.id,
+                  {
+                    status: "paused",
+                    error: error.message,
+                  }
+                ).catch(() => {});
+
+                await sendMessage(
+                  row.chat_id,
+                  `⏸️ JOB PAUSED SAFELY
+
+Reason: ${error.message}
+
+Resume with:
+/resume ${row.id}`
+                ).catch(() => {});
+
+              });
+            }
+
+          } catch (error) {
+
+            console.error(
+              "Queued-job recovery failed:",
+              error
+            );
+
+          }
+
+        }, 1000);
 
       }
     );
