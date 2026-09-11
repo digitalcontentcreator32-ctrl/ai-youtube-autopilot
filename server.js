@@ -23,68 +23,13 @@ const TELEGRAM_API =
 const GEMINI_API =
   "https://generativelanguage.googleapis.com/v1beta";
 
-/* =====================================================
-   DATABASE
-===================================================== */
-
-if (!DATABASE_URL) {
-  console.error("DATABASE_URL missing");
-  process.exit(1);
-}
-
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  },
-  max: 3
+  ssl: { rejectUnauthorized: false },
+  max: 5
 });
 
-async function db(query, params = []) {
-  return pool.query(query, params);
-}
-
-async function initDatabase() {
-  await db(`
-    CREATE TABLE IF NOT EXISTS jobs (
-      id TEXT PRIMARY KEY,
-      chat_id TEXT NOT NULL,
-      topic TEXT NOT NULL,
-
-      status TEXT NOT NULL DEFAULT 'queued',
-      stage TEXT NOT NULL DEFAULT 'Job created',
-      progress INTEGER NOT NULL DEFAULT 0,
-
-      script TEXT,
-      script_model TEXT,
-      word_count INTEGER,
-
-      tts_model TEXT,
-
-      error TEXT,
-
-      attempts INTEGER NOT NULL DEFAULT 0,
-
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      completed_at TIMESTAMPTZ
-    )
-  `);
-
-  await db(`
-    CREATE TABLE IF NOT EXISTS quota_events (
-      id BIGSERIAL PRIMARY KEY,
-      job_id TEXT,
-      provider TEXT,
-      model TEXT,
-      status INTEGER,
-      message TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  console.log("PostgreSQL database initialized");
-}
+const runningJobs = new Set();
 
 /* =====================================================
    HELPERS
@@ -109,8 +54,8 @@ function isQuotaError(error) {
     error?.status === 429 &&
     (
       message.includes("quota") ||
-      message.includes("free_tier") ||
-      message.includes("exceeded")
+      message.includes("exceeded") ||
+      message.includes("free_tier")
     )
   );
 }
@@ -131,6 +76,141 @@ function isTransient(error) {
     message.includes("ECONNRESET") ||
     message.includes("503")
   );
+}
+
+/* =====================================================
+   DATABASE
+===================================================== */
+
+async function initDatabase() {
+  if (!DATABASE_URL) {
+    throw new Error("DATABASE_URL missing");
+  }
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS jobs (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued',
+      stage TEXT DEFAULT 'Job created',
+      progress INTEGER DEFAULT 0,
+
+      script TEXT,
+      script_model TEXT,
+      word_count INTEGER,
+
+      tts_model TEXT,
+      tts_chunk INTEGER DEFAULT 0,
+      tts_total_chunks INTEGER DEFAULT 0,
+
+      error TEXT,
+      attempts INTEGER DEFAULT 0,
+
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  console.log("✅ PostgreSQL database initialized");
+}
+
+async function createJob(job) {
+  await pool.query(
+    `
+    INSERT INTO jobs
+    (id, chat_id, topic, status, stage, progress)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    `,
+    [
+      job.id,
+      String(job.chatId),
+      job.topic,
+      job.status,
+      job.stage,
+      job.progress
+    ]
+  );
+}
+
+async function getJob(id) {
+  const result = await pool.query(
+    `SELECT * FROM jobs WHERE id = $1`,
+    [id]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function updateJob(id, fields) {
+  const allowed = [
+    "status",
+    "stage",
+    "progress",
+    "script",
+    "script_model",
+    "word_count",
+    "tts_model",
+    "tts_chunk",
+    "tts_total_chunks",
+    "error",
+    "attempts"
+  ];
+
+  const entries = Object.entries(fields)
+    .filter(([key]) => allowed.includes(key));
+
+  if (!entries.length) {
+    return;
+  }
+
+  const values = [];
+  const sets = [];
+
+  entries.forEach(([key, value], index) => {
+    values.push(value);
+    sets.push(`${key} = $${index + 1}`);
+  });
+
+  values.push(id);
+
+  await pool.query(
+    `
+    UPDATE jobs
+    SET ${sets.join(", ")},
+        updated_at = NOW()
+    WHERE id = $${values.length}
+    `,
+    values
+  );
+}
+
+async function getUserJobs(chatId) {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM jobs
+    WHERE chat_id = $1
+    ORDER BY created_at DESC
+    LIMIT 10
+    `,
+    [String(chatId)]
+  );
+
+  return result.rows;
+}
+
+async function getStats() {
+  const result = await pool.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE status = 'running') AS running,
+      COUNT(*) FILTER (WHERE status = 'paused') AS paused,
+      COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+      COUNT(*) AS total
+    FROM jobs
+  `);
+
+  return result.rows[0];
 }
 
 /* =====================================================
@@ -155,7 +235,9 @@ async function fetchWithTimeout(
     });
   } catch (error) {
     if (error.name === "AbortError") {
-      throw new Error(`REQUEST_TIMEOUT_${timeoutMs}MS`);
+      throw new Error(
+        `REQUEST_TIMEOUT_${timeoutMs}MS`
+      );
     }
 
     throw error;
@@ -281,13 +363,12 @@ async function geminiText(model, prompt) {
   }
 
   if (!response.ok) {
-    const message =
-      data?.error?.message ||
-      raw ||
-      response.statusText;
-
     const error = new Error(
-      `Gemini ${response.status}: ${message}`
+      `Gemini ${response.status}: ${
+        data?.error?.message ||
+        raw ||
+        response.statusText
+      }`
     );
 
     error.status = response.status;
@@ -309,7 +390,7 @@ async function geminiText(model, prompt) {
 }
 
 /* =====================================================
-   RETRY ENGINE
+   RETRY
 ===================================================== */
 
 async function retryRequest(
@@ -335,38 +416,34 @@ async function retryRequest(
       lastError = error;
 
       console.error(
-        `${label} failed attempt ${attempt}:`,
-        error.message
+        `${label} failed: ${error.message}`
       );
 
-      // Quota exceeded = do NOT waste retries.
+      // IMPORTANT:
+      // Free-tier quota errors are NOT retried.
       if (isQuotaError(error)) {
         throw error;
       }
 
-      if (!isTransient(error)) {
+      if (
+        !isTransient(error) ||
+        attempt >= attempts
+      ) {
         throw error;
       }
 
-      if (attempt < attempts) {
-        const base =
-          Math.min(
-            16000,
-            1500 * (2 ** (attempt - 1))
-          );
+      const wait =
+        Math.min(
+          12000,
+          1500 * (2 ** (attempt - 1))
+        ) +
+        Math.floor(Math.random() * 1000);
 
-        const jitter =
-          Math.floor(Math.random() * 1000);
+      console.log(
+        `${label} retrying after ${wait}ms`
+      );
 
-        const wait =
-          base + jitter;
-
-        console.log(
-          `${label} retrying after ${wait}ms`
-        );
-
-        await sleep(wait);
-      }
+      await sleep(wait);
     }
   }
 
@@ -389,7 +466,7 @@ const SCRIPT_MODELS = [
    SCRIPT GENERATION
 ===================================================== */
 
-async function generateScript(topic, job) {
+async function generateScript(topic) {
   let lastError = null;
 
   for (const model of SCRIPT_MODELS) {
@@ -415,9 +492,10 @@ Requirements:
 - No fake sources
 - No unnecessary headings
 - No "welcome back"
-- Do not mention being an AI
+- Do not mention AI
 - Return ONLY the narration
-- Make every sentence useful and engaging.
+
+Make every sentence useful and engaging.
       `.trim();
 
       const script =
@@ -428,12 +506,10 @@ Requirements:
         );
 
       if (script.length < 1200) {
-        throw new Error("SCRIPT_TOO_SHORT");
+        throw new Error(
+          "SCRIPT_TOO_SHORT"
+        );
       }
-
-      console.log(
-        `Script success: ${model}`
-      );
 
       return {
         script,
@@ -443,16 +519,9 @@ Requirements:
     } catch (error) {
       lastError = error;
 
-      if (isQuotaError(error)) {
-        await recordQuotaEvent(
-          job.id,
-          model,
-          error
-        );
-      }
-
       console.error(
-        `Script model unavailable: ${model} -> ${error.message}`
+        `Script model failed ${model}:`,
+        error.message
       );
 
       await sleep(500);
@@ -501,6 +570,42 @@ function checkScript(script) {
 }
 
 /* =====================================================
+   TEXT CHUNKING
+===================================================== */
+
+function splitText(text, maxChars = 1800) {
+  const words = text.split(/\s+/);
+  const chunks = [];
+
+  let current = "";
+
+  for (const word of words) {
+    if (
+      current.length +
+      word.length +
+      1 >
+      maxChars
+    ) {
+      if (current.trim()) {
+        chunks.push(current.trim());
+      }
+
+      current = word;
+    } else {
+      current +=
+        (current ? " " : "") +
+        word;
+    }
+  }
+
+  if (current.trim()) {
+    chunks.push(current.trim());
+  }
+
+  return chunks;
+}
+
+/* =====================================================
    TTS
 ===================================================== */
 
@@ -513,18 +618,19 @@ async function geminiTTS(model, text) {
   const url =
     "https://generativelanguage.googleapis.com/v1beta/interactions";
 
-  const response = await fetchWithTimeout(
-    url,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY
-      },
-      body: JSON.stringify({
-        model,
+  const response =
+    await fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY
+        },
+        body: JSON.stringify({
+          model,
 
-        input: `
+          input: `
 Speak the following YouTube narration naturally.
 
 Voice:
@@ -539,25 +645,26 @@ Speak ONLY the narration.
 --- BEGIN ---
 ${text}
 --- END ---
-        `.trim(),
+          `.trim(),
 
-        response_format: {
-          type: "audio"
-        },
+          response_format: {
+            type: "audio"
+          },
 
-        generation_config: {
-          speech_config: [
-            {
-              voice: "Kore"
-            }
-          ]
-        }
-      })
-    },
-    60000
-  );
+          generation_config: {
+            speech_config: [
+              {
+                voice: "Kore"
+              }
+            ]
+          }
+        })
+      },
+      60000
+    );
 
-  const raw = await response.text();
+  const raw =
+    await response.text();
 
   let data;
 
@@ -568,13 +675,12 @@ ${text}
   }
 
   if (!response.ok) {
-    const message =
-      data?.error?.message ||
-      raw ||
-      response.statusText;
-
     const error = new Error(
-      `TTS ${response.status}: ${message}`
+      `TTS ${response.status}: ${
+        data?.error?.message ||
+        raw ||
+        response.statusText
+      }`
     );
 
     error.status = response.status;
@@ -588,7 +694,9 @@ ${text}
     data?.audio?.data;
 
   if (!base64) {
-    throw new Error("TTS_AUDIO_MISSING");
+    throw new Error(
+      "TTS_AUDIO_MISSING"
+    );
   }
 
   return Buffer.from(
@@ -618,7 +726,9 @@ function pcmToWav(
     bits / 8;
 
   const wav =
-    Buffer.alloc(44 + pcm.length);
+    Buffer.alloc(
+      44 + pcm.length
+    );
 
   wav.write("RIFF", 0);
 
@@ -628,6 +738,7 @@ function pcmToWav(
   );
 
   wav.write("WAVE", 8);
+
   wav.write("fmt ", 12);
 
   wav.writeUInt32LE(
@@ -682,962 +793,28 @@ function pcmToWav(
 
 /* =====================================================
    VOICE GENERATION
+   CHUNKED + RESUMABLE
 ===================================================== */
 
-async function generateVoice(script, job) {
-  let lastError = null;
-
-  for (const model of TTS_MODELS) {
-    try {
-      console.log(
-        `Trying TTS model: ${model}`
-      );
-
-      const pcm =
-        await retryRequest(
-          () => geminiTTS(model, script),
-          `TTS ${model}`,
-          2
-        );
-
-      if (!pcm.length) {
-        throw new Error(
-          "TTS_EMPTY_AUDIO"
-        );
-      }
-
-      const wav =
-        pcmToWav(pcm);
-
-      console.log(
-        `TTS success: ${model}`
-      );
-
-      return {
-        audio: wav,
-        model
-      };
-
-    } catch (error) {
-      lastError = error;
-
-      if (isQuotaError(error)) {
-        await recordQuotaEvent(
-          job.id,
-          model,
-          error
-        );
-      }
-
-      console.error(
-        `TTS model failed: ${model} -> ${error.message}`
-      );
-
-      await sleep(1000);
-    }
-  }
-
-  throw (
-    lastError ||
-    new Error("ALL_TTS_MODELS_FAILED")
-  );
-}
-
-/* =====================================================
-   QUOTA LOGGING
-===================================================== */
-
-async function recordQuotaEvent(
-  jobIdValue,
-  model,
-  error
-) {
-  try {
-    await db(
-      `
-      INSERT INTO quota_events
-      (
-        job_id,
-        provider,
-        model,
-        status,
-        message
-      )
-      VALUES ($1, $2, $3, $4, $5)
-      `,
-      [
-        jobIdValue,
-        "Google Gemini",
-        model,
-        error?.status || 429,
-        error?.message || "Quota exceeded"
-      ]
-    );
-  } catch (dbError) {
-    console.error(
-      "Quota event DB error:",
-      dbError.message
-    );
-  }
-}
-
-/* =====================================================
-   DATABASE JOB HELPERS
-===================================================== */
-
-async function createJob(
-  id,
-  chatId,
-  topic
-) {
-  await db(
-    `
-    INSERT INTO jobs
-    (
-      id,
-      chat_id,
-      topic,
-      status,
-      stage,
-      progress
-    )
-    VALUES
-    ($1, $2, $3, 'running', 'Job created', 0)
-    `,
-    [
-      id,
-      String(chatId),
-      topic
-    ]
-  );
-}
-
-async function getJob(id) {
-  const result =
-    await db(
-      `SELECT * FROM jobs WHERE id = $1`,
-      [id]
+async function generateVoice(job) {
+  const chunks =
+    splitText(
+      job.script,
+      1800
     );
 
-  return result.rows[0] || null;
-}
-
-async function updateJob(
-  id,
-  fields
-) {
-  const allowed = [
-    "status",
-    "stage",
-    "progress",
-    "script",
-    "script_model",
-    "word_count",
-    "tts_model",
-    "error",
-    "attempts"
-  ];
-
-  const keys =
-    Object.keys(fields)
-      .filter(k => allowed.includes(k));
-
-  if (!keys.length) {
-    return;
-  }
-
-  const values = [];
-  const sets = [];
-
-  keys.forEach((key, index) => {
-    values.push(fields[key]);
-
-    sets.push(
-      `${key} = $${index + 1}`
-    );
-  });
-
-  values.push(id);
-
-  await db(
-    `
-    UPDATE jobs
-    SET
-      ${sets.join(", ")},
-      updated_at = NOW()
-    WHERE id = $${values.length}
-    `,
-    values
-  );
-}
-
-async function completeJob(id) {
-  await db(
-    `
-    UPDATE jobs
-    SET
-      status = 'completed',
-      progress = 100,
-      stage = 'Test completed successfully',
-      completed_at = NOW(),
-      updated_at = NOW()
-    WHERE id = $1
-    `,
-    [id]
-  );
-}
-
-/* =====================================================
-   RUNNING JOB LOCK
-===================================================== */
-
-const runningJobs = new Set();
-
-/* =====================================================
-   JOB PROGRESS
-===================================================== */
-
-async function progress(
-  job,
-  stage,
-  percent
-) {
   await updateJob(
     job.id,
     {
-      stage,
-      progress: percent,
-      status: "running"
+      tts_total_chunks:
+        chunks.length
     }
   );
 
-  console.log(
-    `[${job.id}] ${stage} ${percent}%`
-  );
+  let selectedModel =
+    job.tts_model || null;
 
-  try {
-    await sendMessage(
-      job.chat_id,
-      `🎬 ${stage}\nProgress: ${percent}%`
-    );
-  } catch (error) {
-    console.error(
-      "Progress message failed:",
-      error.message
-    );
-  }
-}
+  let startChunk =
+    Number(job.tts_chunk || 0);
 
-/* =====================================================
-   MAIN JOB
-===================================================== */
-
-async function runJob(job) {
-  if (!job) {
-    return;
-  }
-
-  if (runningJobs.has(job.id)) {
-    console.log(
-      `Job already running: ${job.id}`
-    );
-
-    return;
-  }
-
-  runningJobs.add(job.id);
-
-  try {
-    job =
-      await getJob(job.id);
-
-    if (!job) {
-      return;
-    }
-
-    /*
-      STEP 1
-      Script generation
-    */
-
-    if (!job.script) {
-      await progress(
-        job,
-        "Creator Agent started",
-        5
-      );
-
-      await progress(
-        job,
-        "Generating original script",
-        10
-      );
-
-      const result =
-        await generateScript(
-          job.topic,
-          job
-        );
-
-      await updateJob(
-        job.id,
-        {
-          script: result.script,
-          script_model: result.model,
-          progress: 40,
-          stage:
-            `Script generated — ${result.model}`,
-          status: "running",
-          error: null
-        }
-      );
-
-      job =
-        await getJob(job.id);
-
-    } else {
-      console.log(
-        `[${job.id}] Script already saved. Skipping generation.`
-      );
-    }
-
-    /*
-      STEP 2
-      Quality check
-    */
-
-    const quality =
-      checkScript(job.script);
-
-    if (!quality.passed) {
-      throw new Error(
-        `QUALITY_FAILED_${quality.reason}`
-      );
-    }
-
-    await updateJob(
-      job.id,
-      {
-        word_count: quality.wordCount,
-        stage:
-          `Quality check passed — ${quality.wordCount} words`,
-        progress: 50,
-        status: "running",
-        error: null
-      }
-    );
-
-    /*
-      STEP 3
-      TTS
-    */
-
-    await progress(
-      job,
-      "Generating AI narration",
-      55
-    );
-
-    const voice =
-      await generateVoice(
-        job.script,
-        job
-      );
-
-    await updateJob(
-      job.id,
-      {
-        tts_model: voice.model,
-        progress: 80,
-        stage:
-          `Narration ready — ${voice.model}`,
-        status: "running",
-        error: null
-      }
-    );
-
-    /*
-      STEP 4
-      Telegram audio delivery
-    */
-
-    await sendAudio(
-      job.chat_id,
-      voice.audio,
-      `${job.id}.wav`
-    );
-
-    await completeJob(
-      job.id
-    );
-
-    await sendMessage(
-      job.chat_id,
-      [
-        "✅ JOB COMPLETED",
-        "",
-        `Topic: ${job.topic}`,
-        `Script: ${job.script_model}`,
-        `TTS: ${voice.model}`,
-        `Words: ${job.word_count}`,
-        "",
-        "🎧 Audio sent successfully."
-      ].join("\n")
-    );
-
-  } catch (error) {
-    console.error(
-      `[${job.id}] FINAL ERROR`,
-      error
-    );
-
-    await updateJob(
-      job.id,
-      {
-        status: "paused",
-        error: error.message,
-        stage: "Job paused safely"
-      }
-    );
-
-    try {
-      await sendMessage(
-        job.chat_id,
-        [
-          "⏸️ JOB PAUSED SAFELY",
-          "",
-          `Topic: ${job.topic}`,
-          "",
-          `Reason: ${error.message}`,
-          "",
-          "No paid fallback was used.",
-          "",
-          `Resume later with:`,
-          `/resume ${job.id}`
-        ].join("\n")
-      );
-    } catch {}
-  } finally {
-    runningJobs.delete(job.id);
-  }
-}
-
-/* =====================================================
-   AUTOMATIC RECOVERY
-===================================================== */
-
-async function recoverJobs() {
-  const result =
-    await db(
-      `
-      SELECT *
-      FROM jobs
-      WHERE status = 'running'
-      ORDER BY created_at ASC
-      `
-    );
-
-  if (!result.rows.length) {
-    console.log(
-      "No jobs waiting for recovery."
-    );
-
-    return;
-  }
-
-  console.log(
-    `Recovering ${result.rows.length} interrupted job(s)...`
-  );
-
-  for (const job of result.rows) {
-    console.log(
-      `Recovering job: ${job.id}`
-    );
-
-    /*
-      Script is already stored if it was completed
-      before the restart, so runJob will skip it.
-    */
-
-    runJob(job).catch(error => {
-      console.error(
-        `Recovery error ${job.id}:`,
-        error.message
-      );
-    });
-
-    await sleep(500);
-  }
-}
-
-/* =====================================================
-   TELEGRAM COMMANDS
-===================================================== */
-
-async function handleMessage(message) {
-  if (!message?.chat?.id) {
-    return;
-  }
-
-  const chatId =
-    message.chat.id;
-
-  const text =
-    clean(message.text);
-
-  if (!text) {
-    return;
-  }
-
-  console.log(
-    `Telegram: ${text}`
-  );
-
-  /* -----------------------------------------------
-     START
-  ------------------------------------------------ */
-
-  if (text === "/start") {
-    await sendMessage(
-      chatId,
-      [
-        "🤖 AI YouTube Autopilot",
-        "",
-        "/create <topic>",
-        "/status",
-        "/jobs",
-        "/resume <job_id>",
-        "",
-        "Example:",
-        "/create 5 surprising facts about space"
-      ].join("\n")
-    );
-
-    return;
-  }
-
-  /* -----------------------------------------------
-     STATUS
-  ------------------------------------------------ */
-
-  if (text === "/status") {
-    const result =
-      await db(
-        `
-        SELECT
-          COUNT(*) FILTER (
-            WHERE status = 'running'
-          ) AS running,
-
-          COUNT(*) FILTER (
-            WHERE status = 'paused'
-          ) AS paused,
-
-          COUNT(*) FILTER (
-            WHERE status = 'completed'
-          ) AS completed,
-
-          COUNT(*) AS total
-
-        FROM jobs
-        WHERE chat_id = $1
-        `,
-        [String(chatId)]
-      );
-
-    const row =
-      result.rows[0];
-
-    await sendMessage(
-      chatId,
-      [
-        "📊 SYSTEM STATUS",
-        "",
-        "Backend: ONLINE",
-        `Running: ${row.running}`,
-        `Paused: ${row.paused}`,
-        `Completed: ${row.completed}`,
-        `Total: ${row.total}`,
-        "",
-        "Payment mode: APPROVAL ONLY"
-      ].join("\n")
-    );
-
-    return;
-  }
-
-  /* -----------------------------------------------
-     JOBS
-  ------------------------------------------------ */
-
-  if (text === "/jobs") {
-    const result =
-      await db(
-        `
-        SELECT
-          id,
-          topic,
-          status,
-          progress,
-          stage
-        FROM jobs
-        WHERE chat_id = $1
-        ORDER BY created_at DESC
-        LIMIT 10
-        `,
-        [String(chatId)]
-      );
-
-    if (!result.rows.length) {
-      await sendMessage(
-        chatId,
-        "No jobs found."
-      );
-
-      return;
-    }
-
-    await sendMessage(
-      chatId,
-      result.rows
-        .map(j =>
-          [
-            `ID: ${j.id}`,
-            `Topic: ${j.topic}`,
-            `Status: ${j.status}`,
-            `Progress: ${j.progress}%`,
-            `Stage: ${j.stage}`
-          ].join("\n")
-        )
-        .join("\n\n")
-    );
-
-    return;
-  }
-
-  /* -----------------------------------------------
-     CREATE
-  ------------------------------------------------ */
-
-  if (text.startsWith("/create ")) {
-    const topic =
-      text
-        .slice(8)
-        .trim();
-
-    if (!topic) {
-      await sendMessage(
-        chatId,
-        "Please provide a topic."
-      );
-
-      return;
-    }
-
-    const id =
-      jobId();
-
-    await createJob(
-      id,
-      chatId,
-      topic
-    );
-
-    await sendMessage(
-      chatId,
-      [
-        "🎬 JOB CREATED",
-        "",
-        `ID: ${id}`,
-        `Topic: ${topic}`,
-        "",
-        "Starting Creator Agent..."
-      ].join("\n")
-    );
-
-    const job =
-      await getJob(id);
-
-    runJob(job).catch(error => {
-      console.error(
-        "Background job error:",
-        error
-      );
-    });
-
-    return;
-  }
-
-  /* -----------------------------------------------
-     RESUME
-  ------------------------------------------------ */
-
-  if (text.startsWith("/resume ")) {
-    const id =
-      text
-        .slice(8)
-        .trim();
-
-    if (!id) {
-      await sendMessage(
-        chatId,
-        "Usage: /resume <job_id>"
-      );
-
-      return;
-    }
-
-    const job =
-      await getJob(id);
-
-    if (!job) {
-      await sendMessage(
-        chatId,
-        "❌ Job not found."
-      );
-
-      return;
-    }
-
-    if (
-      String(job.chat_id) !==
-      String(chatId)
-    ) {
-      await sendMessage(
-        chatId,
-        "❌ This job does not belong to this chat."
-      );
-
-      return;
-    }
-
-    if (job.status === "completed") {
-      await sendMessage(
-        chatId,
-        "✅ This job is already completed."
-      );
-
-      return;
-    }
-
-    if (runningJobs.has(job.id)) {
-      await sendMessage(
-        chatId,
-        "▶️ This job is already running."
-      );
-
-      return;
-    }
-
-    await updateJob(
-      job.id,
-      {
-        status: "running",
-        error: null,
-        stage: "Resuming job"
-      }
-    );
-
-    await sendMessage(
-      chatId,
-      [
-        "▶️ JOB RESUMED",
-        "",
-        `ID: ${job.id}`,
-        "Continuing from saved state..."
-      ].join("\n")
-    );
-
-    const updated =
-      await getJob(job.id);
-
-    runJob(updated).catch(error => {
-      console.error(
-        `Resume error ${job.id}:`,
-        error
-      );
-    });
-
-    return;
-  }
-
-  /* -----------------------------------------------
-     UNKNOWN
-  ------------------------------------------------ */
-
-  await sendMessage(
-    chatId,
-    "Unknown command.\n\nUse /start."
-  );
-}
-
-/* =====================================================
-   TELEGRAM WEBHOOK
-===================================================== */
-
-app.post(
-  "/telegram/webhook",
-  (req, res) => {
-    /*
-      Telegram needs an immediate 2xx response.
-    */
-    res.sendStatus(200);
-
-    if (req.body?.message) {
-      handleMessage(
-        req.body.message
-      ).catch(error => {
-        console.error(
-          "Webhook error:",
-          error
-        );
-      });
-    }
-  }
-);
-
-/* =====================================================
-   HEALTH
-===================================================== */
-
-app.get(
-  "/",
-  (req, res) => {
-    res.json({
-      ok: true,
-      service:
-        "AI YouTube Autopilot",
-      telegram:
-        "webhook",
-      database:
-        "postgresql",
-      status:
-        "online"
-    });
-  }
-);
-
-app.get(
-  "/health",
-  async (req, res) => {
-    try {
-      await db("SELECT 1");
-
-      res.json({
-        ok: true,
-        database: "connected",
-        uptime:
-          process.uptime()
-      });
-
-    } catch (error) {
-      res.status(500).json({
-        ok: false,
-        database: "error",
-        error: error.message
-      });
-    }
-  }
-);
-
-/* =====================================================
-   WEBHOOK SETUP
-===================================================== */
-
-async function setupWebhook() {
-  if (!TELEGRAM_BOT_TOKEN) {
-    throw new Error(
-      "TELEGRAM_BOT_TOKEN missing"
-    );
-  }
-
-  if (!GEMINI_API_KEY) {
-    throw new Error(
-      "GEMINI_API_KEY missing"
-    );
-  }
-
-  const webhookUrl =
-    `${BASE_URL.replace(/\/$/, "")}/telegram/webhook`;
-
-  console.log(
-    `Setting Telegram webhook: ${webhookUrl}`
-  );
-
-  await telegram(
-    "setWebhook",
-    {
-      url: webhookUrl,
-      allowed_updates: [
-        "message"
-      ],
-      drop_pending_updates: false
-    }
-  );
-
-  const info =
-    await telegram(
-      "getWebhookInfo"
-    );
-
-  console.log(
-    "Telegram webhook configured:"
-  );
-
-  console.log(
-    JSON.stringify(
-      info,
-      null,
-      2
-    )
-  );
-}
-
-/* =====================================================
-   START
-===================================================== */
-
-async function start() {
-  try {
-    await initDatabase();
-
-    app.listen(
-      PORT,
-      async () => {
-        console.log(
-          `AI YouTube Autopilot listening on port ${PORT}`
-        );
-
-        try {
-          await setupWebhook();
-
-          console.log(
-            "Telegram webhook configured"
-          );
-
-          await recoverJobs();
-
-          console.log(
-            "✅ STARTUP COMPLETE"
-          );
-
-        } catch (error) {
-          console.error(
-            "❌ STARTUP ERROR:",
-            error.message
-          );
-        }
-      }
-    );
-
-  } catch (error) {
-    console.error(
-      "❌ FATAL STARTUP ERROR:",
-      error
-    );
-
-    process.exit(1);
-  }
-}
-
-start();
+  const audioParts
