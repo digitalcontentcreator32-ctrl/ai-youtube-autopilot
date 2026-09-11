@@ -8,9 +8,6 @@ const PORT = process.env.PORT || 10000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const TTS_MODEL = "gemini-3.1-flash-tts-preview";
-const TTS_VOICE = "Kore";
-
 const SCRIPT_MODELS = [
   "gemini-3.8-flash",
   "gemini-3.7-flash",
@@ -18,35 +15,37 @@ const SCRIPT_MODELS = [
   "gemini-3.5-flash-lite"
 ];
 
+const TTS_MODEL = "gemini-3.1-flash-tts-preview";
+const TTS_VOICE = "Kore";
+
 const jobs = new Map();
 
 let telegramOffset = 0;
-let telegramPolling = false;
+let telegramStarted = false;
+
+/* =========================
+   BASIC HELPERS
+========================= */
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function jobId() {
+function createJobId() {
   return `job_${Date.now()}_${jobs.size + 1}`;
 }
 
-function updateJob(id, data) {
-  const job = jobs.get(id);
-  if (!job) return;
-
-  Object.assign(job, data);
-
-  if (job.chatId) {
-    sendTelegram(
-      job.chatId,
-      `📊 *${job.stage || "Working"}*\nProgress: ${job.progress || 0}%`
-    ).catch(() => {});
-  }
-}
+/* =========================
+   TELEGRAM
+========================= */
 
 async function telegramRequest(method, body = {}) {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
+  if (!TELEGRAM_BOT_TOKEN) {
+    throw new Error("TELEGRAM_BOT_TOKEN is missing");
+  }
+
+  const url =
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -59,7 +58,9 @@ async function telegramRequest(method, body = {}) {
   const data = await response.json();
 
   if (!data.ok) {
-    throw new Error(data.description || "Telegram API error");
+    throw new Error(
+      data.description || "Telegram API error"
+    );
   }
 
   return data.result;
@@ -68,18 +69,20 @@ async function telegramRequest(method, body = {}) {
 async function sendTelegram(chatId, text) {
   return telegramRequest("sendMessage", {
     chat_id: chatId,
-    text,
-    parse_mode: "Markdown"
+    text
   });
 }
 
-async function sendAudio(chatId, audioBuffer, filename = "narration.wav") {
+async function sendAudio(chatId, buffer, filename) {
   const form = new FormData();
 
   form.append("chat_id", String(chatId));
+
   form.append(
     "audio",
-    new Blob([audioBuffer], { type: "audio/wav" }),
+    new Blob([buffer], {
+      type: "audio/wav"
+    }),
     filename
   );
 
@@ -94,15 +97,19 @@ async function sendAudio(chatId, audioBuffer, filename = "narration.wav") {
   const data = await response.json();
 
   if (!data.ok) {
-    throw new Error(data.description || "Telegram audio upload failed");
+    throw new Error(
+      data.description || "Telegram audio upload failed"
+    );
   }
 
   return data.result;
 }
 
-/* ---------------- GEMINI ---------------- */
+/* =========================
+   GEMINI REQUEST
+========================= */
 
-async function geminiRequest(model, input, options = {}) {
+async function geminiRequest(model, input, extra = {}) {
   const response = await fetch(
     "https://generativelanguage.googleapis.com/v1beta/interactions",
     {
@@ -114,136 +121,327 @@ async function geminiRequest(model, input, options = {}) {
       body: JSON.stringify({
         model,
         input,
-        ...options
+        ...extra
       })
     }
   );
 
-  const text = await response.text();
+  const raw = await response.text();
 
   let data;
 
   try {
-    data = JSON.parse(text);
+    data = JSON.parse(raw);
   } catch {
-    throw new Error(`Gemini returned invalid response: ${text.slice(0, 500)}`);
+    throw new Error(
+      `Gemini returned invalid JSON: ${raw.slice(0, 500)}`
+    );
   }
 
   if (!response.ok) {
-    const errorMessage =
+    const message =
       data?.error?.message ||
       data?.message ||
       `Gemini HTTP ${response.status}`;
 
-    const error = new Error(errorMessage);
+    const error = new Error(message);
     error.status = response.status;
 
     throw error;
   }
 
+  if (data?.errors?.length) {
+    throw new Error(
+      data.errors.map(x => x.message).join("; ")
+    );
+  }
+
   return data;
 }
 
-/* ---------------- SCRIPT ---------------- */
+/* =========================
+   EXTRACT GEMINI TEXT
+========================= */
+
+function extractGeminiText(data) {
+
+  /* New/direct output_text */
+  if (
+    typeof data?.output_text === "string" &&
+    data.output_text.trim()
+  ) {
+    return data.output_text.trim();
+  }
+
+  /* Interactions API steps */
+  if (Array.isArray(data?.steps)) {
+
+    const pieces = [];
+
+    for (const step of data.steps) {
+
+      if (step?.type !== "model_output") {
+        continue;
+      }
+
+      if (!Array.isArray(step?.content)) {
+        continue;
+      }
+
+      for (const item of step.content) {
+
+        if (
+          item?.type === "text" &&
+          typeof item?.text === "string" &&
+          item.text.trim()
+        ) {
+          pieces.push(item.text.trim());
+        }
+      }
+    }
+
+    if (pieces.length) {
+      return pieces.join("\n\n").trim();
+    }
+  }
+
+  /* Compatibility */
+  if (Array.isArray(data?.outputs)) {
+
+    const pieces = [];
+
+    for (const output of data.outputs) {
+
+      if (
+        typeof output?.text === "string" &&
+        output.text.trim()
+      ) {
+        pieces.push(output.text.trim());
+      }
+
+      if (Array.isArray(output?.content)) {
+
+        for (const item of output.content) {
+
+          if (
+            item?.type === "text" &&
+            typeof item?.text === "string" &&
+            item.text.trim()
+          ) {
+            pieces.push(item.text.trim());
+          }
+        }
+      }
+    }
+
+    if (pieces.length) {
+      return pieces.join("\n\n").trim();
+    }
+  }
+
+  /* Older compatibility */
+  if (
+    typeof data?.text === "string" &&
+    data.text.trim()
+  ) {
+    return data.text.trim();
+  }
+
+  return "";
+}
+
+/* =========================
+   SCRIPT GENERATION
+========================= */
 
 async function generateScript(topic) {
-  let lastError = null;
 
   const prompt = `
-You are an expert YouTube script writer.
+You are the Creator Agent for a professional faceless YouTube channel.
 
-Create a completely original faceless YouTube video script.
+Create a completely original YouTube video script.
 
 TOPIC:
 ${topic}
 
 Requirements:
-- English
-- 500-800 spoken words
-- Strong first 10-second hook
-- Interesting storytelling
-- Easy for AI voice narration
-- No copyrighted lyrics
-- No copied article text
-- No visual directions inside the narration
-- No "AI generated" disclaimer
-- No fake citations
-- Avoid repetitive filler
-- Give useful and entertaining information
 
-Return exactly this structure:
+- English language
+- 500 to 800 spoken words
+- Strong hook in the first 10 seconds
+- Interesting storytelling
+- Natural spoken English
+- Suitable for AI voice narration
+- Original wording
+- No copied article text
+- No copyrighted lyrics
+- No fake quotations
+- No visual instructions
+- No "scene:" instructions
+- No "visual:" instructions
+- No AI disclaimer
+- No unnecessary filler
+- Make the information useful and entertaining
+
+Return EXACTLY this format:
 
 TITLE:
-<short clickable title>
+<clickable YouTube title>
 
 HOOK:
-<opening hook>
+<strong opening hook>
 
 DESCRIPTION:
 <YouTube description>
 
 SCRIPT:
-<complete narration>
+<complete spoken narration>
 `;
 
+  let lastError = null;
+
   for (const model of SCRIPT_MODELS) {
+
     try {
-      const data = await geminiRequest(model, prompt);
 
-      const output =
-        data?.outputs?.[0]?.text ||
-        data?.output_text ||
-        data?.text ||
-        "";
+      console.log(
+        `Trying Gemini script model: ${model}`
+      );
 
-      if (!output.trim()) {
-        throw new Error("Gemini returned empty script");
+      const data = await geminiRequest(
+        model,
+        prompt
+      );
+
+      const scriptText =
+        extractGeminiText(data);
+
+      if (!scriptText) {
+
+        console.log(
+          `Model ${model} returned no readable text.`
+        );
+
+        console.log(
+          "Gemini response keys:",
+          Object.keys(data || {})
+        );
+
+        if (Array.isArray(data?.steps)) {
+          console.log(
+            "Gemini steps:",
+            JSON.stringify(
+              data.steps,
+              null,
+              2
+            ).slice(0, 5000)
+          );
+        }
+
+        throw new Error(
+          "Gemini returned empty script"
+        );
       }
 
       return {
         model,
-        text: output
+        text: scriptText
       };
+
     } catch (error) {
+
       lastError = error;
 
       console.log(
-        `Script model failed: ${model} -> ${error.message}`
+        `Script model failed: ${model}`
       );
 
-      if (![429, 500, 502, 503, 504].includes(error.status)) {
-        break;
+      console.log(error.message);
+
+      const retryable =
+        [429, 500, 502, 503, 504]
+          .includes(error.status);
+
+      if (!retryable) {
+        continue;
       }
 
       await sleep(1500);
     }
   }
 
-  throw lastError || new Error("All script models failed");
+  throw (
+    lastError ||
+    new Error("All Gemini script models failed")
+  );
 }
 
-/* ---------------- QUALITY CHECK ---------------- */
+/* =========================
+   QUALITY CHECK
+========================= */
 
 function qualityCheck(text) {
-  const title = text.match(/TITLE:\s*([\s\S]*?)(?=\nHOOK:|$)/i);
-  const hook = text.match(/HOOK:\s*([\s\S]*?)(?=\nDESCRIPTION:|$)/i);
-  const description = text.match(
-    /DESCRIPTION:\s*([\s\S]*?)(?=\nSCRIPT:|$)/i
-  );
-  const script = text.match(/SCRIPT:\s*([\s\S]*)$/i);
 
-  if (!title || !hook || !script) {
+  const titleMatch =
+    text.match(
+      /TITLE:\s*([\s\S]*?)(?=\nHOOK:|$)/i
+    );
+
+  const hookMatch =
+    text.match(
+      /HOOK:\s*([\s\S]*?)(?=\nDESCRIPTION:|$)/i
+    );
+
+  const descriptionMatch =
+    text.match(
+      /DESCRIPTION:\s*([\s\S]*?)(?=\nSCRIPT:|$)/i
+    );
+
+  const scriptMatch =
+    text.match(
+      /SCRIPT:\s*([\s\S]*)$/i
+    );
+
+  if (!titleMatch) {
     return {
       passed: false,
-      reason: "Required sections are missing"
+      reason: "TITLE missing"
     };
   }
 
-  const scriptText = script[1].trim();
+  if (!hookMatch) {
+    return {
+      passed: false,
+      reason: "HOOK missing"
+    };
+  }
 
-  const words = scriptText
-    .split(/\s+/)
-    .filter(Boolean).length;
+  if (!scriptMatch) {
+    return {
+      passed: false,
+      reason: "SCRIPT missing"
+    };
+  }
+
+  const title =
+    titleMatch[1].trim();
+
+  const hook =
+    hookMatch[1].trim();
+
+  const description =
+    descriptionMatch
+      ? descriptionMatch[1].trim()
+      : "";
+
+  const script =
+    scriptMatch[1].trim();
+
+  const words =
+    script
+      .split(/\s+/)
+      .filter(Boolean)
+      .length;
 
   if (words < 150) {
     return {
@@ -259,197 +457,314 @@ function qualityCheck(text) {
     };
   }
 
-  const blockedPatterns = [
+  const blocked = [
     "visual cue:",
     "[visual]",
+    "scene:",
+    "[scene]",
     "copyrighted lyrics",
     "ai disclaimer"
   ];
 
-  const lower = scriptText.toLowerCase();
+  const lower =
+    script.toLowerCase();
 
-  for (const pattern of blockedPatterns) {
-    if (lower.includes(pattern)) {
+  for (const word of blocked) {
+
+    if (lower.includes(word)) {
+
       return {
         passed: false,
-        reason: `Blocked pattern detected: ${pattern}`
+        reason:
+          `Blocked text detected: ${word}`
       };
     }
   }
 
   return {
     passed: true,
-    title: title[1].trim(),
-    hook: hook[1].trim(),
-    description: description
-      ? description[1].trim()
-      : "",
-    script: scriptText,
+    title,
+    hook,
+    description,
+    script,
     words
   };
 }
 
-/* ---------------- WAV ---------------- */
+/* =========================
+   WAV CREATOR
+========================= */
 
-function createWav(pcmBuffer, sampleRate = 24000) {
+function createWav(
+  pcm,
+  sampleRate = 24000
+) {
+
   const channels = 1;
   const bitsPerSample = 16;
 
-  const byteRate =
-    sampleRate * channels * (bitsPerSample / 8);
-
   const blockAlign =
-    channels * (bitsPerSample / 8);
+    channels * bitsPerSample / 8;
 
-  const header = Buffer.alloc(44);
+  const byteRate =
+    sampleRate * blockAlign;
+
+  const header =
+    Buffer.alloc(44);
 
   header.write("RIFF", 0);
-  header.writeUInt32LE(36 + pcmBuffer.length, 4);
+
+  header.writeUInt32LE(
+    36 + pcm.length,
+    4
+  );
+
   header.write("WAVE", 8);
 
   header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
+
+  header.writeUInt32LE(
+    16,
+    16
+  );
+
+  header.writeUInt16LE(
+    1,
+    20
+  );
+
+  header.writeUInt16LE(
+    channels,
+    22
+  );
+
+  header.writeUInt32LE(
+    sampleRate,
+    24
+  );
+
+  header.writeUInt32LE(
+    byteRate,
+    28
+  );
+
+  header.writeUInt16LE(
+    blockAlign,
+    32
+  );
+
+  header.writeUInt16LE(
+    bitsPerSample,
+    34
+  );
 
   header.write("data", 36);
-  header.writeUInt32LE(pcmBuffer.length, 40);
 
-  return Buffer.concat([header, pcmBuffer]);
+  header.writeUInt32LE(
+    pcm.length,
+    40
+  );
+
+  return Buffer.concat([
+    header,
+    pcm
+  ]);
 }
 
-/* ---------------- TTS ---------------- */
+/* =========================
+   TTS
+========================= */
 
 async function generateVoice(text) {
-  let lastError = null;
 
   const prompt = `
-Read the following YouTube narration naturally.
+Read the following YouTube narration.
 
-Voice style:
+Voice:
+- Natural
 - Clear
 - Professional
 - Energetic
-- Natural pacing
-- Suitable for a YouTube documentary/facts video
-- Do not say anything before or after the narration
+- Documentary style
+- Good pacing
+- American English
 
-Narration:
+Do not add an introduction.
+Do not add an ending.
+Only speak the narration.
+
+NARRATION:
 
 ${text}
 `;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      console.log(`TTS attempt ${attempt}/3`);
+  let lastError = null;
 
-      const data = await geminiRequest(
-        TTS_MODEL,
-        prompt,
-        {
-          response_format: {
-            type: "audio"
-          },
-          generation_config: {
-            speech_config: [
-              {
-                voice: TTS_VOICE,
-                language: "en-US"
-              }
-            ]
-          }
-        }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+
+    try {
+
+      console.log(
+        `TTS attempt ${attempt}/3`
       );
 
-      const audioBase64 =
+      const data =
+        await geminiRequest(
+          TTS_MODEL,
+          prompt,
+          {
+            response_format: {
+              type: "audio"
+            },
+
+            generation_config: {
+              speech_config: [
+                {
+                  voice: TTS_VOICE,
+                  language: "en-US"
+                }
+              ]
+            }
+          }
+        );
+
+      const audioData =
         data?.output_audio?.data;
 
-      if (!audioBase64) {
+      if (!audioData) {
+
+        console.log(
+          "TTS response:",
+          JSON.stringify(
+            data,
+            null,
+            2
+          ).slice(0, 5000)
+        );
+
         throw new Error(
           "Gemini TTS returned no audio data"
         );
       }
 
-      const pcm = Buffer.from(
-        audioBase64,
-        "base64"
-      );
+      const pcm =
+        Buffer.from(
+          audioData,
+          "base64"
+        );
 
       if (!pcm.length) {
-        throw new Error("Generated audio is empty");
+        throw new Error(
+          "TTS audio is empty"
+        );
       }
 
-      return createWav(pcm, 24000);
+      return createWav(
+        pcm,
+        24000
+      );
 
     } catch (error) {
+
       lastError = error;
 
       console.log(
-        `TTS failed attempt ${attempt}: ${error.message}`
+        `TTS attempt ${attempt} failed:`,
+        error.message
       );
 
       if (attempt < 3) {
-        await sleep(1500 * attempt);
+        await sleep(
+          2000 * attempt
+        );
       }
     }
   }
 
-  throw lastError || new Error("TTS failed");
+  throw (
+    lastError ||
+    new Error("TTS generation failed")
+  );
 }
 
-/* ---------------- JOB PROCESSOR ---------------- */
+/* =========================
+   JOB
+========================= */
 
 async function processJob(id) {
-  const job = jobs.get(id);
 
-  if (!job) return;
+  const job =
+    jobs.get(id);
+
+  if (!job) {
+    return;
+  }
 
   try {
-    updateJob(id, {
-      stage: "Creator Agent started",
-      progress: 5,
-      status: "running"
-    });
+
+    job.status = "running";
+    job.stage = "Creator Agent started";
+    job.progress = 5;
 
     await sendTelegram(
       job.chatId,
-      `🚀 *Creator Agent started*\nJob: ${id}`
+      `🚀 Creator Agent started
+
+Job: ${id}
+
+Progress: 5%`
     );
 
     /* SCRIPT */
 
-    updateJob(id, {
-      stage: "Generating original script",
-      progress: 10
-    });
+    job.stage =
+      "Generating original script";
 
-    const generated = await generateScript(job.topic);
-
-    job.model = generated.model;
-    job.rawScript = generated.text;
-
-    updateJob(id, {
-      stage: "Script generated",
-      progress: 40
-    });
+    job.progress = 10;
 
     await sendTelegram(
       job.chatId,
-      `📝 Script generated\nModel: ${generated.model}`
+      `📊 Generating original script
+
+Progress: 10%`
+    );
+
+    const result =
+      await generateScript(
+        job.topic
+      );
+
+    job.model =
+      result.model;
+
+    job.rawScript =
+      result.text;
+
+    job.stage =
+      "Script generated";
+
+    job.progress = 40;
+
+    await sendTelegram(
+      job.chatId,
+      `📝 Script generated
+
+Model: ${result.model}
+
+Progress: 40%`
     );
 
     /* QUALITY */
 
-    updateJob(id, {
-      stage: "Quality check",
-      progress: 45
-    });
+    job.stage =
+      "Running quality check";
 
-    const quality = qualityCheck(generated.text);
+    job.progress = 45;
+
+    const quality =
+      qualityCheck(
+        result.text
+      );
 
     if (!quality.passed) {
       throw new Error(
@@ -457,50 +772,68 @@ async function processJob(id) {
       );
     }
 
-    job.title = quality.title;
-    job.description = quality.description;
-    job.script = quality.script;
-    job.words = quality.words;
+    job.title =
+      quality.title;
 
-    updateJob(id, {
-      stage: "Quality check passed",
-      progress: 50
-    });
+    job.description =
+      quality.description;
+
+    job.script =
+      quality.script;
+
+    job.words =
+      quality.words;
+
+    job.stage =
+      "Quality check passed";
+
+    job.progress = 50;
 
     await sendTelegram(
       job.chatId,
-      `✅ Quality check passed\nWords: ${quality.words}`
+      `✅ Quality check passed
+
+Words: ${quality.words}
+
+Progress: 50%`
     );
 
     /* TTS */
 
-    updateJob(id, {
-      stage: "Generating AI narration",
-      progress: 55
-    });
+    job.stage =
+      "Generating AI narration";
+
+    job.progress = 55;
 
     await sendTelegram(
       job.chatId,
-      `🎙️ Generating AI narration...`
+      `🎙️ Generating AI narration...
+
+Progress: 55%`
     );
 
-    const audio = await generateVoice(
-      quality.script
-    );
+    const audio =
+      await generateVoice(
+        quality.script
+      );
 
-    job.audioSize = audio.length;
+    job.audioBytes =
+      audio.length;
 
-    updateJob(id, {
-      stage: "AI narration generated",
-      progress: 80
-    });
+    job.stage =
+      "AI narration generated";
+
+    job.progress = 80;
 
     await sendTelegram(
       job.chatId,
-      `🎧 AI narration generated\nSending audio...`
+      `🎧 AI narration generated
+
+Sending audio...
+Progress: 80%`
     );
 
-    /* TELEGRAM AUDIO */
+    /* SEND AUDIO */
 
     await sendAudio(
       job.chatId,
@@ -510,16 +843,20 @@ async function processJob(id) {
 
     /* COMPLETE */
 
-    updateJob(id, {
-      stage: "Completed",
-      progress: 100,
-      status: "completed",
-      completedAt: new Date().toISOString()
-    });
+    job.status =
+      "completed";
+
+    job.stage =
+      "Completed";
+
+    job.progress = 100;
+
+    job.completedAt =
+      new Date().toISOString();
 
     await sendTelegram(
       job.chatId,
-      `🎉 *Job completed!*
+      `🎉 JOB COMPLETED
 
 Title:
 ${job.title}
@@ -530,28 +867,34 @@ ${job.words}
 Model:
 ${job.model}
 
-Status:
 ✅ Script
 ✅ Quality check
 ✅ AI narration
-✅ Telegram audio`
+✅ Audio sent`
     );
 
   } catch (error) {
-    console.error("JOB ERROR:", error);
 
-    const job = jobs.get(id);
+    console.error(
+      "JOB ERROR:",
+      error
+    );
 
-    if (job) {
-      job.status = "paused";
-      job.stage = "Paused";
-      job.error = error.message;
-      job.pausedAt = new Date().toISOString();
-    }
+    job.status =
+      "paused";
+
+    job.stage =
+      "Paused";
+
+    job.error =
+      error.message;
+
+    job.pausedAt =
+      new Date().toISOString();
 
     await sendTelegram(
       job.chatId,
-      `⚠️ *Job paused*
+      `⚠️ JOB PAUSED
 
 Reason:
 ${error.message}
@@ -564,22 +907,29 @@ ${id}`
   }
 }
 
-/* ---------------- TELEGRAM COMMANDS ---------------- */
+/* =========================
+   TELEGRAM COMMANDS
+========================= */
 
-async function handleTelegramMessage(message) {
-  const chatId = message?.chat?.id;
-  const text = message?.text?.trim();
+async function handleMessage(message) {
 
-  if (!chatId || !text) return;
+  const chatId =
+    message?.chat?.id;
 
-  console.log(
-    `Telegram message from ${chatId}: ${text}`
-  );
+  const text =
+    message?.text?.trim();
+
+  if (!chatId || !text) {
+    return;
+  }
+
+  /* START */
 
   if (text === "/start") {
+
     await sendTelegram(
       chatId,
-      `🤖 *AI YouTube Autopilot*
+      `🤖 AI YouTube Autopilot
 
 Commands:
 
@@ -595,27 +945,41 @@ Example:
     return;
   }
 
+  /* STATUS */
+
   if (text === "/status") {
+
     await sendTelegram(
       chatId,
-      `🟢 *System Online*
+      `🟢 SYSTEM ONLINE
 
 Creator Agent: Ready
 Gemini: Connected
-Telegram: Connected
 TTS: Ready
-Mode: Free-first`
+Telegram: Connected
+Mode: Free-first
+
+Jobs: ${jobs.size}`
     );
 
     return;
   }
 
+  /* JOBS */
+
   if (text === "/jobs") {
-    const userJobs = [...jobs.values()]
-      .filter(j => String(j.chatId) === String(chatId))
-      .slice(-10);
+
+    const userJobs =
+      [...jobs.values()]
+        .filter(
+          j =>
+            String(j.chatId) ===
+            String(chatId)
+        )
+        .slice(-10);
 
     if (!userJobs.length) {
+
       await sendTelegram(
         chatId,
         "📭 No jobs found."
@@ -624,50 +988,75 @@ Mode: Free-first`
       return;
     }
 
-    const list = userJobs
-      .map(
-        j =>
-          `• ${j.id}\n  ${j.status} — ${j.progress}%\n  ${j.topic}`
-      )
-      .join("\n\n");
+    const list =
+      userJobs
+        .map(
+          j =>
+            `• ${j.id}
+Status: ${j.status}
+Progress: ${j.progress}%
+Topic: ${j.topic}`
+        )
+        .join("\n\n");
 
     await sendTelegram(
       chatId,
-      `📋 *Recent Jobs*\n\n${list}`
+      `📋 RECENT JOBS
+
+${list}`
     );
 
     return;
   }
 
-  if (text.startsWith("/create ")) {
-    const topic = text
-      .replace("/create ", "")
-      .trim();
+  /* CREATE */
+
+  if (
+    text.startsWith("/create ")
+  ) {
+
+    const topic =
+      text
+        .replace(
+          "/create ",
+          ""
+        )
+        .trim();
 
     if (!topic) {
+
       await sendTelegram(
         chatId,
-        "❌ Topic missing.\n\nExample:\n/create facts about space"
+        `❌ Topic missing.
+
+Example:
+
+/create facts about space`
       );
 
       return;
     }
 
-    const id = jobId();
+    const id =
+      createJobId();
 
-    jobs.set(id, {
+    jobs.set(
       id,
-      chatId,
-      topic,
-      status: "queued",
-      stage: "Job created",
-      progress: 0,
-      createdAt: new Date().toISOString()
-    });
+      {
+        id,
+        chatId,
+        topic,
+        status: "queued",
+        stage: "Job created",
+        progress: 0,
+        createdAt:
+          new Date().toISOString()
+      }
+    );
 
     await sendTelegram(
       chatId,
-      `🆕 *Job created*
+      `🆕 JOB CREATED
 
 Job:
 ${id}
@@ -678,16 +1067,25 @@ ${topic}
 Starting Creator Agent...`
     );
 
-    processJob(id).catch(console.error);
+    processJob(id)
+      .catch(error =>
+        console.error(
+          "Background job error:",
+          error
+        )
+      );
 
     return;
   }
+
+  /* UNKNOWN */
 
   await sendTelegram(
     chatId,
     `❓ Unknown command.
 
 Use:
+
 /start
 /status
 /jobs
@@ -695,42 +1093,63 @@ Use:
   );
 }
 
-/* ---------------- TELEGRAM POLLING ---------------- */
+/* =========================
+   TELEGRAM POLLING
+========================= */
 
-async function telegramPoll() {
-  if (telegramPolling) return;
+async function startTelegramPolling() {
 
-  telegramPolling = true;
+  if (telegramStarted) {
+    return;
+  }
 
-  console.log("Telegram polling enabled");
+  telegramStarted = true;
+
+  console.log(
+    "Telegram polling enabled"
+  );
 
   while (true) {
-    try {
-      const updates = await telegramRequest(
-        "getUpdates",
-        {
-          offset: telegramOffset,
-          timeout: 25,
-          allowed_updates: ["message"]
-        }
-      );
 
-      for (const update of updates) {
-        telegramOffset = update.update_id + 1;
+    try {
+
+      const updates =
+        await telegramRequest(
+          "getUpdates",
+          {
+            offset:
+              telegramOffset,
+            timeout: 25,
+            allowed_updates: [
+              "message"
+            ]
+          }
+        );
+
+      for (
+        const update of updates
+      ) {
+
+        telegramOffset =
+          update.update_id + 1;
 
         try {
-          await handleTelegramMessage(
+
+          await handleMessage(
             update.message
           );
+
         } catch (error) {
+
           console.error(
-            "Telegram message error:",
+            "Message error:",
             error
           );
         }
       }
 
     } catch (error) {
+
       console.error(
         "Telegram polling error:",
         error.message
@@ -741,47 +1160,83 @@ async function telegramPoll() {
   }
 }
 
-/* ---------------- HEALTH ---------------- */
+/* =========================
+   HEALTH
+========================= */
 
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "AI YouTube Autopilot",
-    status: "online",
-    time: new Date().toISOString()
-  });
-});
+app.get(
+  "/",
+  (req, res) => {
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    telegram: !!TELEGRAM_BOT_TOKEN,
-    gemini: !!GEMINI_API_KEY,
-    ttsModel: TTS_MODEL,
-    jobs: jobs.size
-  });
-});
+    res.json({
+      ok: true,
+      service:
+        "AI YouTube Autopilot",
+      status: "online",
+      ttsModel: TTS_MODEL,
+      jobs: jobs.size,
+      time:
+        new Date().toISOString()
+    });
+  }
+);
 
-/* ---------------- START ---------------- */
+app.get(
+  "/health",
+  (req, res) => {
 
-app.listen(PORT, () => {
-  console.log(
-    `AI YouTube Autopilot listening on port ${PORT}`
-  );
+    res.json({
+      ok: true,
+      telegram:
+        Boolean(
+          TELEGRAM_BOT_TOKEN
+        ),
+      gemini:
+        Boolean(
+          GEMINI_API_KEY
+        ),
+      ttsModel:
+        TTS_MODEL,
+      jobs:
+        jobs.size
+    });
+  }
+);
 
-  if (!TELEGRAM_BOT_TOKEN) {
-    console.error(
-      "TELEGRAM_BOT_TOKEN is missing"
+/* =========================
+   START SERVER
+========================= */
+
+app.listen(
+  PORT,
+  () => {
+
+    console.log(
+      `AI YouTube Autopilot listening on ${PORT}`
     );
-  }
 
-  if (!GEMINI_API_KEY) {
-    console.error(
-      "GEMINI_API_KEY is missing"
+    console.log(
+      `TTS model: ${TTS_MODEL}`
     );
-  }
 
-  if (TELEGRAM_BOT_TOKEN) {
-    telegramPoll().catch(console.error);
+    if (!TELEGRAM_BOT_TOKEN) {
+      console.error(
+        "❌ TELEGRAM_BOT_TOKEN missing"
+      );
+    }
+
+    if (!GEMINI_API_KEY) {
+      console.error(
+        "❌ GEMINI_API_KEY missing"
+      );
+    }
+
+    if (
+      TELEGRAM_BOT_TOKEN &&
+      GEMINI_API_KEY
+    ) {
+      startTelegramPolling()
+        .catch(console.error);
+    }
   }
-});
+);
