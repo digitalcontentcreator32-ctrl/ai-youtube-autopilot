@@ -203,6 +203,169 @@ async function initDatabase() {
       tts_total_chunks =
         COALESCE(tts_total_chunks, 0),
       tts_completed_chunks =
+async function initDatabase() {
+  console.log("Starting PostgreSQL database initialization...");
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS jobs (
+      id TEXT PRIMARY KEY,
+      topic TEXT NOT NULL,
+      chat_id BIGINT,
+      status TEXT NOT NULL DEFAULT 'queued',
+      progress INTEGER NOT NULL DEFAULT 0,
+      stage TEXT DEFAULT 'queued',
+      script TEXT,
+      error TEXT,
+      tts_total_chunks INTEGER DEFAULT 0,
+      tts_completed_chunks INTEGER DEFAULT 0,
+      tts_current_chunk INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  /* =========================
+     JOBS MIGRATION
+  ========================= */
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS chat_id BIGINT
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS script TEXT
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS error TEXT
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS stage TEXT DEFAULT 'queued'
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'queued'
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_total_chunks INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_completed_chunks INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_current_chunk INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  /* =========================
+     AUDIO CHUNKS TABLE
+  ========================= */
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS job_audio_chunks (
+      job_id TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      audio_data BYTEA,
+      mime_type TEXT,
+      status TEXT DEFAULT 'pending',
+      model TEXT,
+      error TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (job_id, chunk_index)
+    )
+  `);
+
+  /*
+    IMPORTANT:
+    The table may already exist from an older
+    version of the application.
+
+    Therefore every required column is checked
+    separately below.
+  */
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS job_id TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS chunk_index INTEGER
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS audio_data BYTEA
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS mime_type TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS model TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS error TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  /* =========================
+     DEFAULT VALUES
+  ========================= */
+
+  await db(`
+    UPDATE jobs
+    SET
+      tts_total_chunks =
+        COALESCE(tts_total_chunks, 0),
+      tts_completed_chunks =
         COALESCE(tts_completed_chunks, 0),
       tts_current_chunk =
         COALESCE(tts_current_chunk, 0),
@@ -276,7 +439,7 @@ async function initDatabase() {
   console.log(
     "PostgreSQL database initialized and migrations checked"
   );
-}
+      }
 
 /* =========================
    TELEGRAM
