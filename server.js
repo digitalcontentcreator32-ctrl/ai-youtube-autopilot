@@ -41,6 +41,8 @@ async function db(query, params = []) {
 ========================= */
 
 async function initDatabase() {
+  console.log("Starting PostgreSQL database initialization...");
+
   await db(`
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
@@ -51,19 +53,46 @@ async function initDatabase() {
       stage TEXT DEFAULT 'queued',
       script TEXT,
       error TEXT,
-      tts_total_chunks INTEGER NOT NULL DEFAULT 0,
-      tts_completed_chunks INTEGER NOT NULL DEFAULT 0,
-      tts_current_chunk INTEGER NOT NULL DEFAULT 0,
+      tts_total_chunks INTEGER DEFAULT 0,
+      tts_completed_chunks INTEGER DEFAULT 0,
+      tts_current_chunk INTEGER DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
 
-  /* ===== JOBS MIGRATION ===== */
+  /* =========================
+     JOBS MIGRATION
+  ========================= */
 
   await db(`
     ALTER TABLE jobs
     ADD COLUMN IF NOT EXISTS chat_id BIGINT
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS script TEXT
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS error TEXT
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS stage TEXT DEFAULT 'queued'
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'queued'
   `);
 
   await db(`
@@ -81,7 +110,19 @@ async function initDatabase() {
     ADD COLUMN IF NOT EXISTS tts_current_chunk INTEGER DEFAULT 0
   `);
 
-  /* ===== AUDIO CHUNKS TABLE ===== */
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  /* =========================
+     AUDIO CHUNKS TABLE
+  ========================= */
 
   await db(`
     CREATE TABLE IF NOT EXISTS job_audio_chunks (
@@ -89,7 +130,7 @@ async function initDatabase() {
       chunk_index INTEGER NOT NULL,
       audio_data BYTEA,
       mime_type TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
+      status TEXT DEFAULT 'pending',
       model TEXT,
       error TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -98,7 +139,24 @@ async function initDatabase() {
     )
   `);
 
-  /* ===== OLD TABLE MIGRATION ===== */
+  /*
+    IMPORTANT:
+    The table may already exist from an older
+    version of the application.
+
+    Therefore every required column is checked
+    separately below.
+  */
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS job_id TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS chunk_index INTEGER
+  `);
 
   await db(`
     ALTER TABLE job_audio_chunks
@@ -134,6 +192,86 @@ async function initDatabase() {
     ALTER TABLE job_audio_chunks
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
   `);
+
+  /* =========================
+     DEFAULT VALUES
+  ========================= */
+
+  await db(`
+    UPDATE jobs
+    SET
+      tts_total_chunks =
+        COALESCE(tts_total_chunks, 0),
+      tts_completed_chunks =
+        COALESCE(tts_completed_chunks, 0),
+      tts_current_chunk =
+        COALESCE(tts_current_chunk, 0),
+      progress =
+        COALESCE(progress, 0),
+      stage =
+        COALESCE(stage, 'queued'),
+      status =
+        COALESCE(status, 'queued'),
+      updated_at =
+        COALESCE(updated_at, NOW())
+  `);
+
+  await db(`
+    UPDATE job_audio_chunks
+    SET
+      status =
+        COALESCE(status, 'pending'),
+      created_at =
+        COALESCE(created_at, NOW()),
+      updated_at =
+        COALESCE(updated_at, NOW())
+  `);
+
+  /* =========================
+     FINAL SCHEMA VERIFICATION
+  ========================= */
+
+  const check = await db(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'job_audio_chunks'
+    ORDER BY ordinal_position
+  `);
+
+  const columns =
+    check.rows.map(
+      row => row.column_name
+    );
+
+  const required = [
+    "job_id",
+    "chunk_index",
+    "audio_data",
+    "mime_type",
+    "status",
+    "model",
+    "error",
+    "created_at",
+    "updated_at"
+  ];
+
+  const missing =
+    required.filter(
+      column =>
+        !columns.includes(column)
+    );
+
+  if (missing.length > 0) {
+    throw new Error(
+      `DATABASE MIGRATION FAILED. Missing job_audio_chunks columns: ${missing.join(", ")}`
+    );
+  }
+
+  console.log(
+    "job_audio_chunks schema verified:",
+    columns.join(", ")
+  );
 
   console.log(
     "PostgreSQL database initialized and migrations checked"
