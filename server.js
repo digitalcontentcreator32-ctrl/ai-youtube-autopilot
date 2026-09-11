@@ -59,10 +59,29 @@ async function initDatabase() {
     )
   `);
 
-  await db(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS chat_id BIGINT`);
-  await db(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tts_total_chunks INTEGER DEFAULT 0`);
-  await db(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tts_completed_chunks INTEGER DEFAULT 0`);
-  await db(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tts_current_chunk INTEGER DEFAULT 0`);
+  /* ===== JOBS MIGRATION ===== */
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS chat_id BIGINT
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_total_chunks INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_completed_chunks INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_current_chunk INTEGER DEFAULT 0
+  `);
+
+  /* ===== AUDIO CHUNKS TABLE ===== */
 
   await db(`
     CREATE TABLE IF NOT EXISTS job_audio_chunks (
@@ -79,7 +98,46 @@ async function initDatabase() {
     )
   `);
 
-  console.log("PostgreSQL database initialized");
+  /* ===== OLD TABLE MIGRATION ===== */
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS audio_data BYTEA
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS mime_type TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS model TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS error TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  console.log(
+    "PostgreSQL database initialized and migrations checked"
+  );
 }
 
 /* =========================
