@@ -34,15 +34,15 @@ async function telegram(method, body) {
 async function sendMessage(chatId, text) {
   return telegram("sendMessage", {
     chat_id: chatId,
-    text
+    text: text
   });
 }
 
 function createJob(command, chatId) {
   const job = {
     id: newId(),
-    command,
-    chatId,
+    command: command,
+    chatId: chatId,
     status: "queued",
     progress: 0,
     createdAt: new Date().toISOString()
@@ -63,6 +63,7 @@ app.get("/", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
+    service: "AI YouTube Autopilot",
     telegramConfigured: Boolean(TOKEN),
     jobs: jobs.size
   });
@@ -90,7 +91,7 @@ app.post("/api/command", (req, res) => {
 
   res.json({
     ok: true,
-    job
+    job: job
   });
 });
 
@@ -107,7 +108,7 @@ async function handleTelegramUpdate(update) {
   if (text === "/start") {
     await sendMessage(
       chatId,
-      "AI YouTube Autopilot connected!\n\n/status - system status\\n/create <request> - create Creator Agent job\\n/stop - emergency stop"
+      "AI YouTube Autopilot connected!\n\n/status - system status\n/create <request> - create Creator Agent job\n/jobs - show jobs\n/stop - emergency stop"
     );
     return;
   }
@@ -115,25 +116,53 @@ async function handleTelegramUpdate(update) {
   if (text === "/status") {
     await sendMessage(
       chatId,
-      `System: ONLINE\\nTelegram: CONNECTED\\nJobs: ${jobs.size}\\nMode: FREE-FIRST`
+      `System: ONLINE\nTelegram: CONNECTED\nJobs: ${jobs.size}\nMode: FREE-FIRST`
     );
     return;
   }
 
+  if (text === "/jobs") {
+    const userJobs = [...jobs.values()]
+      .filter(job => job.chatId === chatId);
+
+    if (userJobs.length === 0) {
+      await sendMessage(
+        chatId,
+        "No jobs found."
+      );
+      return;
+    }
+
+    const lines = userJobs.map(
+      job =>
+        `${job.id} - ${job.status.toUpperCase()} - ${job.progress}%`
+    );
+
+    await sendMessage(
+      chatId,
+      `Your jobs:\n\n${lines.join("\n")}`
+    );
+
+    return;
+  }
+
   if (text === "/stop") {
+    let stopped = 0;
+
     for (const job of jobs.values()) {
       if (
         job.chatId === chatId &&
         (job.status === "queued" ||
-         job.status === "running")
+          job.status === "running")
       ) {
         job.status = "paused";
+        stopped++;
       }
     }
 
     await sendMessage(
       chatId,
-      "Emergency stop applied. Jobs are paused safely."
+      `Emergency stop applied.\nPaused jobs: ${stopped}`
     );
 
     return;
@@ -146,13 +175,23 @@ async function handleTelegramUpdate(update) {
       : text;
 
   if (command) {
-    const job = createJob(command, chatId);
+    const job = createJob(
+      command,
+      chatId
+    );
 
     await sendMessage(
       chatId,
-      `Request saved ✅\nJob: ${job.id}\nStatus: QUEUED`
+      `Request saved ✅\n\nJob: ${job.id}\nStatus: QUEUED\nProgress: 0%`
     );
+
+    return;
   }
+
+  await sendMessage(
+    chatId,
+    "Unknown command.\n\nUse /status, /create <request>, /jobs or /stop."
+  );
 }
 
 async function pollTelegram() {
@@ -165,7 +204,9 @@ async function pollTelegram() {
 
   let offset = 0;
 
-  console.log("Telegram polling enabled.");
+  console.log(
+    "Telegram polling enabled."
+  );
 
   while (true) {
     try {
@@ -173,7 +214,7 @@ async function pollTelegram() {
         "getUpdates",
         {
           timeout: 25,
-          offset,
+          offset: offset,
           allowed_updates: ["message"]
         }
       );
@@ -181,12 +222,25 @@ async function pollTelegram() {
       if (result.ok) {
         for (const update of result.result || []) {
           offset = update.update_id + 1;
-          await handleTelegramUpdate(update);
+
+          try {
+            await handleTelegramUpdate(update);
+          } catch (error) {
+            console.error(
+              "Update handling error:",
+              error.message
+            );
+          }
         }
+      } else {
+        console.error(
+          "Telegram API error:",
+          result.description
+        );
       }
     } catch (error) {
       console.error(
-        "Telegram error:",
+        "Telegram connection error:",
         error.message
       );
 
