@@ -653,98 +653,48 @@ function splitIntoChunks(
    TTS
 ========================= */
 
-async function generateTTSChunk(
-  text,
-  model
-) {
+async function generateTTSChunk(text, model) {
   const controller = new AbortController();
-
-  const timeoutMs = 120000;
-
-  const timer = setTimeout(
-    () => controller.abort(),
-    timeoutMs
-  );
-
+  const timer = setTimeout(() => controller.abort(), 120000);
   try {
     const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/interactions",
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY,
-          "Api-Revision": "2026-05-20",
+          "x-goog-api-key": GEMINI_API_KEY
         },
         body: JSON.stringify({
-          model,
-          input: text,
-          response_format: {
-            type: "audio",
-          },
-          generation_config: {
-            speech_config: [
-              {
-                voice: "Kore",
-              },
-            ],
-          },
+          contents: [{ parts: [{ text: `Read this narration aloud naturally. Only synthesize the narration:\n\n${text}` }] }],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: "Kore" }
+              }
+            }
+          }
         }),
-        signal: controller.signal,
+        signal: controller.signal
       }
     );
-
     const raw = await response.text();
-
-    if (!response.ok) {
-      const error = new Error(
-        `TTS ${response.status}: ${raw}`
-      );
-
-      error.status = response.status;
-
-      throw error;
-    }
-
+    if (!response.ok) throw new Error(`TTS ${response.status}: ${raw}`);
     const result = JSON.parse(raw);
-
-    const audioData =
-      result?.output_audio?.data;
-
-    if (!audioData) {
-      throw new Error(
-        "TTS returned no audio data"
-      );
-    }
-
-    return {
-      buffer: Buffer.from(
-        audioData,
-        "base64"
-      ),
-      mimeType:
-        result?.output_audio?.mime_type ||
-        "audio/wav",
-      sampleRate:
-        result?.output_audio?.sample_rate ||
-        24000,
-    };
-  } catch (error) {
-    if (error.name === "AbortError") {
-      const e = new Error(
-        `TTS_REQUEST_TIMEOUT_${timeoutMs}MS`
-      );
-
-      e.code = "TIMEOUT";
-
-      throw e;
-    }
-
-    throw error;
+    const audioData = result?.candidates?.[0]?.content?.parts?.find(
+      part => part?.inlineData?.data
+    )?.inlineData?.data;
+    if (!audioData) throw new Error("TTS returned no audio data");
+    const pcm = Buffer.from(audioData, "base64");
+    const buffer = isWav(pcm) ? pcm : pcmToWav(pcm, 24000, 1, 16);
+    if (!isWav(buffer)) throw new Error("Invalid WAV output");
+    return { buffer, mimeType: "audio/wav", sampleRate: 24000 };
   } finally {
     clearTimeout(timer);
   }
 }
+
 async function generateTTSWithRetry(text) {
   let lastError;
   const model=TTS_MODELS[0];
