@@ -638,15 +638,11 @@ function splitIntoChunks(
 async function generateTTSChunk(text, model) {
   const controller = new AbortController();
   const timeoutMs = 120000;
-
-  const timer = setTimeout(
-    () => controller.abort(),
-    timeoutMs
-  );
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/interactions",
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
       {
         method: "POST",
         headers: {
@@ -654,20 +650,24 @@ async function generateTTSChunk(text, model) {
           "x-goog-api-key": GEMINI_API_KEY,
         },
         body: JSON.stringify({
-          model,
-          input: text,
-          response_format: {
-            type: "audio",
-            mime_type: "audio/wav",
-            delivery: "inline",
-          },
-          generation_config: {
-            speech_config: [
-              {
-                voice: "Kore",
-                language: "en-US",
+          contents: [
+            {
+              parts: [
+                {
+                  text: `Read the following narration aloud naturally. Only synthesize the spoken narration:\n\n${text}`,
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: "Kore",
+                },
               },
-            ],
+            },
           },
         }),
         signal: controller.signal,
@@ -675,64 +675,43 @@ async function generateTTSChunk(text, model) {
     );
 
     const raw = await response.text();
-
     if (!response.ok) {
-      const error = new Error(
-        `TTS ${response.status}: ${raw}`
-      );
-
+      const error = new Error(`TTS ${response.status}: ${raw}`);
       error.status = response.status;
-
       throw error;
     }
 
     const result = JSON.parse(raw);
-
-    // IMPORTANT:
-    // This is a REST call. `output_audio` is an SDK convenience
-    // property and is not the raw REST response field.
-    const audioOutput = Array.isArray(result?.outputs)
-      ? result.outputs.find(
-          (output) => output?.type === "audio"
-        )
-      : null;
-
-    const audioData = audioOutput?.data;
+    const audioData = result?.candidates?.[0]?.content?.parts?.find(
+      (part) => part?.inlineData?.data
+    )?.inlineData?.data;
 
     if (!audioData) {
       throw new Error(
-        `TTS returned no audio data. REST response keys: ${Object.keys(result || {}).join(", ")}`
+        `TTS returned no audio data. Response keys=${Object.keys(result || {}).join(",")}`
       );
     }
 
-    const buffer = Buffer.from(audioData, "base64");
+    const pcmBuffer = Buffer.from(audioData, "base64");
+    const buffer = isWav(pcmBuffer)
+      ? pcmBuffer
+      : pcmToWav(pcmBuffer, 24000, 1, 16);
 
     if (!isWav(buffer)) {
-      throw new Error(
-        `TTS returned non-WAV audio (${audioOutput?.mime_type || "unknown MIME type"})`
-      );
+      throw new Error("TTS audio conversion failed: invalid WAV output");
     }
 
     return {
       buffer,
-      mimeType:
-        audioOutput?.mime_type ||
-        "audio/wav",
-      sampleRate:
-        audioOutput?.sample_rate ||
-        24000,
+      mimeType: "audio/wav",
+      sampleRate: 24000,
     };
   } catch (error) {
     if (error.name === "AbortError") {
-      const e = new Error(
-        `TTS_REQUEST_TIMEOUT_${timeoutMs}MS`
-      );
-
+      const e = new Error(`TTS_REQUEST_TIMEOUT_${timeoutMs}MS`);
       e.code = "TIMEOUT";
-
       throw e;
     }
-
     throw error;
   } finally {
     clearTimeout(timer);
@@ -751,7 +730,16 @@ async function generateLocalPiperTTS(text) {
     await new Promise((resolve, reject) => {
       const child = spawn(
         python,
-        ["-m", "piper", "--model", model, "--output_file", outputFile],
+        [
+          "-m",
+          "piper",
+          "--model",
+          model,
+          "--data-dir",
+          workDir,
+          "--output_file",
+          outputFile,
+        ],
         { stdio: ["pipe", "pipe", "pipe"] }
       );
 
@@ -811,7 +799,18 @@ async function generateTTSWithRetry(text) {
         );
 
         if (error.status === 429) {
-          console.log(`Gemini quota/rate limit hit; skipping remaining Gemini retries for ${model}.`);
+          console.log("Gemini quota/rate limit hit; using local Piper fallback immediately.");
+          lastError = error;
+          return await generateLocalPiperTTS(text).catch((fallbackError) => {
+            const combined = new Error(`All TTS providers unavailable. Gemini: ${error.message}. Local Piper: ${fallbackError.message}`);
+            combined.code = "TTS_ALL_PROVIDERS_FAILED";
+            combined.cause = fallbackError;
+            throw combined;
+          });
+        }
+
+        if (error.status === 400 || error.status === 401 || error.status === 403) {
+          console.log(`Gemini request rejected with ${error.status}; moving to local Piper fallback.`);
           break;
         }
 
