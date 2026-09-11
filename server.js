@@ -679,7 +679,6 @@ async function generateTTSChunk(
           input: text,
           response_format: {
             type: "audio",
-            mime_type: "audio/wav",
           },
           generation_config: {
             speech_config: [
