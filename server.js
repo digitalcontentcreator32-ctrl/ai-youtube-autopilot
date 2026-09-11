@@ -5,9 +5,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 
 const jobs = new Map();
 let jobCounter = 1;
+let telegramOffset = 0;
 
 function newId() {
   return "job_" + Date.now() + "_" + jobCounter++;
@@ -22,7 +24,9 @@ function createJob(command, chatId) {
     progress: 0,
     stage: "Waiting",
     createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
+    updatedAt: new Date().toISOString(),
+    result: null,
+    error: null
   };
 
   jobs.set(job.id, job);
@@ -30,9 +34,7 @@ function createJob(command, chatId) {
 }
 
 async function telegram(method, body) {
-  if (!TOKEN) {
-    throw new Error("TELEGRAM_BOT_TOKEN is not configured");
-  }
+  if (!TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not configured");
 
   const response = await fetch(
     `https://api.telegram.org/bot${TOKEN}/${method}`,
@@ -68,120 +70,202 @@ function updateJob(job, status, progress, stage) {
   job.updatedAt = new Date().toISOString();
 }
 
-/*
-  CREATOR AGENT PIPELINE
+function extractGeminiText(data) {
+  if (data?.output_text) {
+    return data.output_text;
+  }
 
-  Current version creates the automation pipeline/state.
-  Real AI providers will be connected in the next stage.
-*/
+  const steps = data?.steps || [];
+
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i];
+
+    if (step?.type === "model_output" && Array.isArray(step.content)) {
+      const text = step.content
+        .filter(x => x?.type === "text")
+        .map(x => x.text || "")
+        .join("\n");
+
+      if (text.trim()) return text;
+    }
+  }
+
+  return "";
+}
+
+async function generateScript(command) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is not configured");
+  }
+
+  const prompt = `
+You are the Creator Agent for an automated YouTube channel.
+
+User request:
+${command}
+
+Create an ORIGINAL YouTube video package.
+
+Return ONLY valid JSON with these fields:
+{
+  "title": "engaging YouTube title",
+  "hook": "strong opening hook",
+  "script": "complete narration script",
+  "description": "YouTube description",
+  "tags": ["tag1", "tag2", "tag3"],
+  "shorts_hook": "shorts opening hook",
+  "visual_plan": [
+    "scene 1 visual",
+    "scene 2 visual",
+    "scene 3 visual"
+  ]
+}
+
+Rules:
+- Do not copy existing videos.
+- Avoid fabricated facts.
+- Make the script original and useful.
+- Keep the narration natural.
+- Do not include copyrighted lyrics or copied text.
+- If the user asks for a Short, make the script suitable for a short-form video.
+- If the user asks for a long video, make the script suitable for a long-form video.
+`;
+
+  const response = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/interactions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash",
+        input: prompt,
+        response_format: {
+          type: "text",
+          mime_type: "application/json",
+          schema: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              hook: { type: "string" },
+              script: { type: "string" },
+              description: { type: "string" },
+              tags: {
+                type: "array",
+                items: { type: "string" }
+              },
+              shorts_hook: { type: "string" },
+              visual_plan: {
+                type: "array",
+                items: { type: "string" }
+              }
+            },
+            required: [
+              "title",
+              "hook",
+              "script",
+              "description",
+              "tags",
+              "shorts_hook",
+              "visual_plan"
+            ]
+          }
+        }
+      })
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    console.error("Gemini error:", JSON.stringify(data));
+    throw new Error(
+      data?.error?.message ||
+      `Gemini request failed with HTTP ${response.status}`
+    );
+  }
+
+  const text = extractGeminiText(data);
+
+  if (!text) {
+    throw new Error("Gemini returned no text");
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {
+      title: "AI Generated Video",
+      hook: "",
+      script: text,
+      description: "",
+      tags: [],
+      shorts_hook: "",
+      visual_plan: []
+    };
+  }
+}
+
 async function processJob(job) {
-  if (job.status !== "queued") return;
+  try {
+    updateJob(job, "running", 5, "Starting Creator Agent");
 
-  updateJob(job, "running", 5, "Starting Creator Agent");
+    await sendMessage(
+      job.chatId,
+      `🤖 Creator Agent started\nJob: ${job.id}\nProgress: 5%`
+    );
 
-  await sendMessage(
-    job.chatId,
-    `🚀 Creator Agent started\nJob: ${job.id}\nProgress: 5%`
-  );
+    updateJob(job, "running", 20, "Sending request to Gemini");
 
-  await new Promise(resolve => setTimeout(resolve, 1500));
+    const result = await generateScript(job.command);
 
-  if (job.status === "paused") return;
+    updateJob(job, "running", 70, "AI script created");
 
-  updateJob(job, "running", 20, "Researching topic");
+    job.result = result;
 
-  await new Promise(resolve => setTimeout(resolve, 1500));
+    await sendMessage(
+      job.chatId,
+      `🧠 Gemini script generated\nJob: ${job.id}\nProgress: 70%\n\nTitle: ${result.title}`
+    );
 
-  if (job.status === "paused") return;
+    updateJob(job, "completed", 100, "Script Ready");
 
-  updateJob(job, "running", 40, "Creating original script");
+    await sendMessage(
+      job.chatId,
+      `✅ Creator Agent finished\nJob: ${job.id}\nProgress: 100%\n\n🎬 TITLE\n${result.title}\n\n🪝 HOOK\n${result.hook}\n\n📝 SCRIPT\n${result.script.slice(0, 3500)}`
+    );
 
-  await new Promise(resolve => setTimeout(resolve, 1500));
+  } catch (error) {
+    console.error("Job error:", error);
 
-  if (job.status === "paused") return;
+    updateJob(job, "paused", job.progress, "Gemini/API Error");
+    job.error = error.message;
 
-  updateJob(job, "running", 60, "Preparing voice and visuals");
-
-  await new Promise(resolve => setTimeout(resolve, 1500));
-
-  if (job.status === "paused") return;
-
-  updateJob(job, "running", 80, "Preparing video");
-
-  await new Promise(resolve => setTimeout(resolve, 1500));
-
-  if (job.status === "paused") return;
-
-  updateJob(job, "completed", 100, "Ready");
-
-  await sendMessage(
-    job.chatId,
-    `✅ Creator Agent finished\n\nJob: ${job.id}\nStatus: COMPLETED\nProgress: 100%\n\n⚠️ AI video providers are not connected yet.`
-  );
-
-  console.log(`Job completed: ${job.id}`);
+    await sendMessage(
+      job.chatId,
+      `⚠️ Job paused\nJob: ${job.id}\n\nReason:\n${error.message}\n\nNo paid service was charged.`
+    );
+  }
 }
 
 function startQueuedJobs() {
-  setInterval(() => {
-    for (const job of jobs.values()) {
-      if (job.status === "queued") {
-        processJob(job);
-      }
+  setInterval(async () => {
+    const job = [...jobs.values()].find(
+      j => j.status === "queued"
+    );
+
+    if (job) {
+      await processJob(job);
     }
   }, 2000);
 }
 
-app.get("/", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "AI YouTube Autopilot",
-    version: "2.0"
-  });
-});
-
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "AI YouTube Autopilot",
-    telegramConfigured: Boolean(TOKEN),
-    jobs: jobs.size
-  });
-});
-
-app.get("/api/jobs", (_req, res) => {
-  res.json({
-    jobs: [...jobs.values()]
-  });
-});
-
-app.post("/api/command", (req, res) => {
-  const command = String(req.body?.command || "").trim();
-
-  if (!command) {
-    return res.status(400).json({
-      ok: false,
-      error: "command is required"
-    });
-  }
-
-  const job = createJob(
-    command,
-    req.body?.chatId || null
-  );
-
-  res.json({
-    ok: true,
-    job
-  });
-});
-
 async function handleTelegramUpdate(update) {
   const message = update?.message;
 
-  if (!message?.chat?.id || !message?.text) {
-    return;
-  }
+  if (!message?.text) return;
 
   const chatId = message.chat.id;
   const text = message.text.trim();
@@ -189,30 +273,38 @@ async function handleTelegramUpdate(update) {
   if (text === "/start") {
     await sendMessage(
       chatId,
-      `AI YouTube Autopilot connected! 🤖
+      `🚀 AI YouTube Autopilot
 
-/status - system status
-/create <request> - create Creator Agent job
-/jobs - show jobs
-/stop - emergency stop`
+ONLINE ✅
+
+Commands:
+/status
+/create <your video request>
+/jobs
+/stop
+
+FREE-FIRST MODE: ON`
     );
     return;
   }
 
   if (text === "/status") {
-    const running = [...jobs.values()]
-      .filter(job => job.status === "running").length;
-
-    const queued = [...jobs.values()]
-      .filter(job => job.status === "queued").length;
+    const allJobs = [...jobs.values()];
+    const running = allJobs.filter(j => j.status === "running").length;
+    const queued = allJobs.filter(j => j.status === "queued").length;
 
     await sendMessage(
       chatId,
-      `System: ONLINE
-Telegram: CONNECTED
+      `📊 SYSTEM STATUS
+
+Backend: ONLINE ✅
+Telegram: CONNECTED ✅
+Gemini: ${GEMINI_API_KEY ? "CONFIGURED ✅" : "NOT CONFIGURED ❌"}
+
 Running: ${running}
 Queued: ${queued}
-Total jobs: ${jobs.size}
+Total jobs: ${allJobs.length}
+
 Mode: FREE-FIRST`
     );
     return;
@@ -220,20 +312,22 @@ Mode: FREE-FIRST`
 
   if (text === "/jobs") {
     const userJobs = [...jobs.values()]
-      .filter(job => job.chatId === chatId);
+      .filter(j => String(j.chatId) === String(chatId))
+      .slice(-10);
 
-    if (userJobs.length === 0) {
+    if (!userJobs.length) {
       await sendMessage(chatId, "No jobs found.");
       return;
     }
 
-    const lines = userJobs.map(job =>
-      `${job.id}\n${job.status.toUpperCase()} | ${job.progress}% | ${job.stage}`
+    const lines = userJobs.map(
+      j =>
+        `${j.id}\n${j.status.toUpperCase()} | ${j.progress}% | ${j.stage}`
     );
 
     await sendMessage(
       chatId,
-      `Your jobs:\n\n${lines.join("\n\n")}`
+      `📋 YOUR JOBS\n\n${lines.join("\n\n")}`
     );
     return;
   }
@@ -243,12 +337,11 @@ Mode: FREE-FIRST`
 
     for (const job of jobs.values()) {
       if (
-        job.chatId === chatId &&
-        (job.status === "queued" ||
-         job.status === "running")
+        String(job.chatId) === String(chatId) &&
+        (job.status === "queued" || job.status === "running")
       ) {
         job.status = "paused";
-        job.stage = "Paused by emergency stop";
+        job.stage = "Stopped by user";
         job.updatedAt = new Date().toISOString();
         stopped++;
       }
@@ -256,7 +349,9 @@ Mode: FREE-FIRST`
 
     await sendMessage(
       chatId,
-      `🛑 Emergency stop applied.\nPaused jobs: ${stopped}`
+      stopped
+        ? `🛑 ${stopped} job(s) paused.`
+        : "No running or queued jobs."
     );
 
     return;
@@ -264,80 +359,97 @@ Mode: FREE-FIRST`
 
   const command = text.startsWith("/create ")
     ? text.slice(8).trim()
-    : text.startsWith("/")
-      ? ""
-      : text;
+    : text;
 
-  if (command) {
-    const job = createJob(command, chatId);
-
+  if (!command) {
     await sendMessage(
       chatId,
-      `Request saved ✅
-
-Job: ${job.id}
-Status: QUEUED
-Progress: 0%
-
-Creator Agent will start processing.`
-    );
-  }
-}
-
-async function pollTelegram() {
-  if (!TOKEN) {
-    console.log(
-      "TELEGRAM_BOT_TOKEN is not configured yet."
+      "Use:\n/create Make a 30-second YouTube Short about space"
     );
     return;
   }
 
-  let offset = 0;
+  const job = createJob(command, chatId);
 
-  console.log("Telegram polling enabled.");
-
-  while (true) {
-    try {
-      const result = await telegram(
-        "getUpdates",
-        {
-          timeout: 25,
-          offset,
-          allowed_updates: ["message"]
-        }
-      );
-
-      if (result.ok) {
-        for (const update of result.result || []) {
-          offset = update.update_id + 1;
-
-          try {
-            await handleTelegramUpdate(update);
-          } catch (error) {
-            console.error(
-              "Update error:",
-              error.message
-            );
-          }
-        }
-      }
-    } catch (error) {
-      console.error(
-        "Telegram error:",
-        error.message
-      );
-
-      await new Promise(resolve =>
-        setTimeout(resolve, 5000)
-      );
-    }
-  }
+  await sendMessage(
+    chatId,
+    `📥 Request saved\n\nJob: ${job.id}\nStatus: QUEUED\nProgress: 0%`
+  );
 }
 
+async function pollTelegram() {
+  if (!TOKEN) {
+    console.log("Telegram polling disabled: token missing");
+    return;
+  }
+
+  try {
+    const response = await telegram("getUpdates", {
+      offset: telegramOffset,
+      timeout: 20
+    });
+
+    if (response?.ok && Array.isArray(response.result)) {
+      for (const update of response.result) {
+        telegramOffset = update.update_id + 1;
+
+        try {
+          await handleTelegramUpdate(update);
+        } catch (error) {
+          console.error("Telegram update error:", error.message);
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Telegram polling error:", error.message);
+  }
+
+  setTimeout(pollTelegram, 1000);
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    name: "AI YouTube Autopilot",
+    status: "online",
+    version: "3.0-gemini"
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    telegram: Boolean(TOKEN),
+    gemini: Boolean(GEMINI_API_KEY),
+    jobs: jobs.size
+  });
+});
+
+app.get("/api/jobs", (req, res) => {
+  res.json([...jobs.values()]);
+});
+
+app.post("/api/command", async (req, res) => {
+  const command = String(req.body?.command || "").trim();
+
+  if (!command) {
+    return res.status(400).json({
+      ok: false,
+      error: "command is required"
+    });
+  }
+
+  const job = createJob(command, req.body?.chatId || null);
+
+  res.json({
+    ok: true,
+    job
+  });
+});
+
 app.listen(PORT, () => {
-  console.log(
-    `AI YouTube Autopilot listening on ${PORT}`
-  );
+  console.log(`AI YouTube Autopilot listening on ${PORT}`);
+  console.log(`Telegram polling: ${TOKEN ? "enabled" : "disabled"}`);
+  console.log(`Gemini: ${GEMINI_API_KEY ? "configured" : "missing"}`);
 
   startQueuedJobs();
   pollTelegram();
