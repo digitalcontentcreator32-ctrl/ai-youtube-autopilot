@@ -5,491 +5,82 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const GEMINI_MODELS = [
+const TTS_MODEL = "gemini-3.1-flash-tts-preview";
+const TTS_VOICE = "Kore";
+
+const SCRIPT_MODELS = [
   "gemini-3.8-flash",
   "gemini-3.7-flash",
   "gemini-3.6-flash",
   "gemini-3.5-flash-lite"
 ];
 
-const TTS_MODEL = "gemini-2.5-flash-preview-tts";
-const TTS_VOICE = "Kore";
-
 const jobs = new Map();
+
+let telegramOffset = 0;
+let telegramPolling = false;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/* ---------------- TELEGRAM ---------------- */
+function jobId() {
+  return `job_${Date.now()}_${jobs.size + 1}`;
+}
 
-async function telegram(method, body = {}) {
-  if (!TELEGRAM_BOT_TOKEN) {
-    throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
+function updateJob(id, data) {
+  const job = jobs.get(id);
+  if (!job) return;
+
+  Object.assign(job, data);
+
+  if (job.chatId) {
+    sendTelegram(
+      job.chatId,
+      `📊 *${job.stage || "Working"}*\nProgress: ${job.progress || 0}%`
+    ).catch(() => {});
+  }
+}
+
+async function telegramRequest(method, body = {}) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  const data = await response.json();
+
+  if (!data.ok) {
+    throw new Error(data.description || "Telegram API error");
   }
 
-  const response = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    }
-  );
-
-  return response.json();
+  return data.result;
 }
 
 async function sendTelegram(chatId, text) {
-  return telegram("sendMessage", {
+  return telegramRequest("sendMessage", {
     chat_id: chatId,
-    text
+    text,
+    parse_mode: "Markdown"
   });
 }
 
-/* ---------------- GEMINI SCRIPT ---------------- */
-
-function isTemporaryGeminiError(status, message) {
-  const text = String(message || "").toLowerCase();
-
-  return (
-    status === 429 ||
-    status === 503 ||
-    text.includes("high demand") ||
-    text.includes("temporarily unavailable") ||
-    text.includes("overloaded") ||
-    text.includes("resource exhausted") ||
-    text.includes("try again later") ||
-    text.includes("unavailable")
-  );
-}
-
-function extractGeminiText(data) {
-  if (data?.output_text) {
-    return data.output_text;
-  }
-
-  for (const step of data?.steps || []) {
-    if (step?.type === "model_output") {
-      if (typeof step.content === "string") {
-        return step.content;
-      }
-
-      if (Array.isArray(step.content)) {
-        for (const item of step.content) {
-          if (typeof item?.text === "string") {
-            return item.text;
-          }
-        }
-      }
-    }
-  }
-
-  return "";
-}
-
-async function generateWithModel(model, command) {
-  const prompt = `
-You are the Creator Agent of an AI YouTube Autopilot.
-
-Create an ORIGINAL YouTube video package for:
-
-${command}
-
-Return exactly:
-
-TITLE:
-HOOK:
-DESCRIPTION:
-SCRIPT:
-
-The SCRIPT must be narration-ready.
-
-Rules:
-- Original writing only.
-- Do not copy another creator.
-- No copyrighted lyrics.
-- Avoid fake facts.
-- Keep facts scientifically responsible.
-- Make it engaging for a faceless YouTube channel.
-- Use natural spoken English.
-- Do not put visual instructions inside the narration.
-- Target approximately 500-800 spoken words.
-`;
-
-  const response = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/interactions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY
-      },
-      body: JSON.stringify({
-        model,
-        input: prompt
-      })
-    }
-  );
-
-  const raw = await response.text();
-
-  let data;
-
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    data = { raw };
-  }
-
-  if (!response.ok) {
-    const message =
-      data?.error?.message ||
-      data?.message ||
-      data?.raw ||
-      `Gemini HTTP ${response.status}`;
-
-    const error = new Error(message);
-    error.status = response.status;
-    error.temporary = isTemporaryGeminiError(
-      response.status,
-      message
-    );
-
-    throw error;
-  }
-
-  const text = extractGeminiText(data);
-
-  if (!text) {
-    throw new Error("Gemini returned an empty response.");
-  }
-
-  return text;
-}
-
-async function generateScript(command) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY is not configured.");
-  }
-
-  let lastError = null;
-
-  for (const model of GEMINI_MODELS) {
-    try {
-      console.log(`Trying Gemini model: ${model}`);
-
-      const text = await generateWithModel(
-        model,
-        command
-      );
-
-      return {
-        model,
-        text
-      };
-
-    } catch (error) {
-      lastError = error;
-
-      console.log(
-        `${model} failed: ${error.message}`
-      );
-
-      if (!error.temporary) {
-        throw error;
-      }
-
-      await sleep(1500);
-    }
-  }
-
-  throw new Error(
-    `All Gemini models failed. Last error: ${
-      lastError?.message || "Unknown error"
-    }`
-  );
-}
-
-/* ---------------- QUALITY CHECK ---------------- */
-
-function extractSection(text, section, nextSections = []) {
-  const startRegex = new RegExp(
-    `\\b${section}:\\s*`,
-    "i"
-  );
-
-  const start = text.search(startRegex);
-
-  if (start === -1) {
-    return "";
-  }
-
-  const afterStart =
-    text.slice(start).replace(startRegex, "");
-
-  let end = afterStart.length;
-
-  for (const next of nextSections) {
-    const regex = new RegExp(
-      `\\b${next}:\\s*`,
-      "i"
-    );
-
-    const index = afterStart.search(regex);
-
-    if (index !== -1 && index < end) {
-      end = index;
-    }
-  }
-
-  return afterStart
-    .slice(0, end)
-    .trim();
-}
-
-function qualityCheck(text) {
-  const title = extractSection(
-    text,
-    "TITLE",
-    ["HOOK", "DESCRIPTION", "SCRIPT"]
-  );
-
-  const hook = extractSection(
-    text,
-    "HOOK",
-    ["DESCRIPTION", "SCRIPT"]
-  );
-
-  const description = extractSection(
-    text,
-    "DESCRIPTION",
-    ["SCRIPT"]
-  );
-
-  const script = extractSection(
-    text,
-    "SCRIPT",
-    []
-  );
-
-  const errors = [];
-
-  if (!title) {
-    errors.push("Missing title");
-  }
-
-  if (!hook) {
-    errors.push("Missing hook");
-  }
-
-  if (!script) {
-    errors.push("Missing script");
-  }
-
-  const wordCount = script
-    ? script.split(/\s+/).filter(Boolean).length
-    : 0;
-
-  if (wordCount < 150) {
-    errors.push("Script is too short");
-  }
-
-  if (wordCount > 2500) {
-    errors.push("Script is unusually long");
-  }
-
-  const lower = script.toLowerCase();
-
-  const unwanted = [
-    "[visual cue:",
-    "copyrighted lyrics",
-    "i am an ai",
-    "as an ai language model"
-  ];
-
-  for (const phrase of unwanted) {
-    if (lower.includes(phrase)) {
-      errors.push(`Unwanted content: ${phrase}`);
-    }
-  }
-
-  return {
-    passed: errors.length === 0,
-    errors,
-    title,
-    hook,
-    description,
-    script,
-    wordCount
-  };
-}
-
-/* ---------------- WAV CREATOR ---------------- */
-
-function createWav(pcmBuffer, sampleRate = 24000) {
-  const channels = 1;
-  const bitsPerSample = 16;
-
-  const byteRate =
-    sampleRate *
-    channels *
-    (bitsPerSample / 8);
-
-  const blockAlign =
-    channels * (bitsPerSample / 8);
-
-  const buffer = Buffer.alloc(
-    44 + pcmBuffer.length
-  );
-
-  buffer.write("RIFF", 0);
-  buffer.writeUInt32LE(
-    36 + pcmBuffer.length,
-    4
-  );
-
-  buffer.write("WAVE", 8);
-  buffer.write("fmt ", 12);
-
-  buffer.writeUInt32LE(16, 16);
-  buffer.writeUInt16LE(1, 20);
-  buffer.writeUInt16LE(channels, 22);
-  buffer.writeUInt32LE(sampleRate, 24);
-  buffer.writeUInt32LE(byteRate, 28);
-  buffer.writeUInt16LE(blockAlign, 32);
-  buffer.writeUInt16LE(bitsPerSample, 34);
-
-  buffer.write("data", 36);
-  buffer.writeUInt32LE(
-    pcmBuffer.length,
-    40
-  );
-
-  pcmBuffer.copy(buffer, 44);
-
-  return buffer;
-}
-
-/* ---------------- AI VOICE ---------------- */
-
-async function generateVoice(text) {
-  if (!GEMINI_API_KEY) {
-    throw new Error(
-      "GEMINI_API_KEY is not configured."
-    );
-  }
-
-  const prompt = `
-Read the following YouTube narration as a professional,
-clear, natural American-English documentary narrator.
-
-Style:
-- confident
-- energetic
-- cinematic
-- natural pauses
-- easy to understand
-- not overly dramatic
-
-Narration:
-
-${text}
-`;
-
-  const response = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/interactions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY
-      },
-      body: JSON.stringify({
-        model: TTS_MODEL,
-        input: prompt,
-        response_format: {
-          type: "audio"
-        },
-        generation_config: {
-          speech_config: [
-            {
-              voice: TTS_VOICE
-            }
-          ]
-        }
-      })
-    }
-  );
-
-  const raw = await response.text();
-
-  let data;
-
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    data = { raw };
-  }
-
-  if (!response.ok) {
-    const message =
-      data?.error?.message ||
-      data?.message ||
-      data?.raw ||
-      `TTS HTTP ${response.status}`;
-
-    throw new Error(message);
-  }
-
-  const audioBase64 =
-    data?.output_audio?.data;
-
-  if (!audioBase64) {
-    throw new Error(
-      "TTS returned no audio data."
-    );
-  }
-
-  const pcm = Buffer.from(
-    audioBase64,
-    "base64"
-  );
-
-  return createWav(pcm);
-}
-
-/* ---------------- TELEGRAM AUDIO ---------------- */
-
-async function sendAudio(
-  chatId,
-  audioBuffer,
-  caption
-) {
+async function sendAudio(chatId, audioBuffer, filename = "narration.wav") {
   const form = new FormData();
 
-  form.append(
-    "chat_id",
-    String(chatId)
-  );
-
-  form.append(
-    "caption",
-    caption
-  );
-
+  form.append("chat_id", String(chatId));
   form.append(
     "audio",
-    new Blob(
-      [audioBuffer],
-      { type: "audio/wav" }
-    ),
-    "narration.wav"
+    new Blob([audioBuffer], { type: "audio/wav" }),
+    filename
   );
 
   const response = await fetch(
@@ -500,361 +91,697 @@ async function sendAudio(
     }
   );
 
-  return response.json();
+  const data = await response.json();
+
+  if (!data.ok) {
+    throw new Error(data.description || "Telegram audio upload failed");
+  }
+
+  return data.result;
 }
 
-/* ---------------- JOB ---------------- */
+/* ---------------- GEMINI ---------------- */
 
-function createJob(command, chatId) {
-  const id =
-    `job_${Date.now()}_${jobs.size + 1}`;
+async function geminiRequest(model, input, options = {}) {
+  const response = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/interactions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
+      },
+      body: JSON.stringify({
+        model,
+        input,
+        ...options
+      })
+    }
+  );
 
-  const job = {
-    id,
-    command,
-    chatId,
-    status: "queued",
-    progress: 0,
-    createdAt:
-      new Date().toISOString(),
-    updatedAt:
-      new Date().toISOString()
-  };
+  const text = await response.text();
 
-  jobs.set(id, job);
+  let data;
 
-  return job;
-}
-
-async function processJob(job) {
   try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Gemini returned invalid response: ${text.slice(0, 500)}`);
+  }
+
+  if (!response.ok) {
+    const errorMessage =
+      data?.error?.message ||
+      data?.message ||
+      `Gemini HTTP ${response.status}`;
+
+    const error = new Error(errorMessage);
+    error.status = response.status;
+
+    throw error;
+  }
+
+  return data;
+}
+
+/* ---------------- SCRIPT ---------------- */
+
+async function generateScript(topic) {
+  let lastError = null;
+
+  const prompt = `
+You are an expert YouTube script writer.
+
+Create a completely original faceless YouTube video script.
+
+TOPIC:
+${topic}
+
+Requirements:
+- English
+- 500-800 spoken words
+- Strong first 10-second hook
+- Interesting storytelling
+- Easy for AI voice narration
+- No copyrighted lyrics
+- No copied article text
+- No visual directions inside the narration
+- No "AI generated" disclaimer
+- No fake citations
+- Avoid repetitive filler
+- Give useful and entertaining information
+
+Return exactly this structure:
+
+TITLE:
+<short clickable title>
+
+HOOK:
+<opening hook>
+
+DESCRIPTION:
+<YouTube description>
+
+SCRIPT:
+<complete narration>
+`;
+
+  for (const model of SCRIPT_MODELS) {
+    try {
+      const data = await geminiRequest(model, prompt);
+
+      const output =
+        data?.outputs?.[0]?.text ||
+        data?.output_text ||
+        data?.text ||
+        "";
+
+      if (!output.trim()) {
+        throw new Error("Gemini returned empty script");
+      }
+
+      return {
+        model,
+        text: output
+      };
+    } catch (error) {
+      lastError = error;
+
+      console.log(
+        `Script model failed: ${model} -> ${error.message}`
+      );
+
+      if (![429, 500, 502, 503, 504].includes(error.status)) {
+        break;
+      }
+
+      await sleep(1500);
+    }
+  }
+
+  throw lastError || new Error("All script models failed");
+}
+
+/* ---------------- QUALITY CHECK ---------------- */
+
+function qualityCheck(text) {
+  const title = text.match(/TITLE:\s*([\s\S]*?)(?=\nHOOK:|$)/i);
+  const hook = text.match(/HOOK:\s*([\s\S]*?)(?=\nDESCRIPTION:|$)/i);
+  const description = text.match(
+    /DESCRIPTION:\s*([\s\S]*?)(?=\nSCRIPT:|$)/i
+  );
+  const script = text.match(/SCRIPT:\s*([\s\S]*)$/i);
+
+  if (!title || !hook || !script) {
+    return {
+      passed: false,
+      reason: "Required sections are missing"
+    };
+  }
+
+  const scriptText = script[1].trim();
+
+  const words = scriptText
+    .split(/\s+/)
+    .filter(Boolean).length;
+
+  if (words < 150) {
+    return {
+      passed: false,
+      reason: `Script too short: ${words} words`
+    };
+  }
+
+  if (words > 2500) {
+    return {
+      passed: false,
+      reason: `Script too long: ${words} words`
+    };
+  }
+
+  const blockedPatterns = [
+    "visual cue:",
+    "[visual]",
+    "copyrighted lyrics",
+    "ai disclaimer"
+  ];
+
+  const lower = scriptText.toLowerCase();
+
+  for (const pattern of blockedPatterns) {
+    if (lower.includes(pattern)) {
+      return {
+        passed: false,
+        reason: `Blocked pattern detected: ${pattern}`
+      };
+    }
+  }
+
+  return {
+    passed: true,
+    title: title[1].trim(),
+    hook: hook[1].trim(),
+    description: description
+      ? description[1].trim()
+      : "",
+    script: scriptText,
+    words
+  };
+}
+
+/* ---------------- WAV ---------------- */
+
+function createWav(pcmBuffer, sampleRate = 24000) {
+  const channels = 1;
+  const bitsPerSample = 16;
+
+  const byteRate =
+    sampleRate * channels * (bitsPerSample / 8);
+
+  const blockAlign =
+    channels * (bitsPerSample / 8);
+
+  const header = Buffer.alloc(44);
+
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcmBuffer.length, 4);
+  header.write("WAVE", 8);
+
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+
+  header.write("data", 36);
+  header.writeUInt32LE(pcmBuffer.length, 40);
+
+  return Buffer.concat([header, pcmBuffer]);
+}
+
+/* ---------------- TTS ---------------- */
+
+async function generateVoice(text) {
+  let lastError = null;
+
+  const prompt = `
+Read the following YouTube narration naturally.
+
+Voice style:
+- Clear
+- Professional
+- Energetic
+- Natural pacing
+- Suitable for a YouTube documentary/facts video
+- Do not say anything before or after the narration
+
+Narration:
+
+${text}
+`;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      console.log(`TTS attempt ${attempt}/3`);
+
+      const data = await geminiRequest(
+        TTS_MODEL,
+        prompt,
+        {
+          response_format: {
+            type: "audio"
+          },
+          generation_config: {
+            speech_config: [
+              {
+                voice: TTS_VOICE,
+                language: "en-US"
+              }
+            ]
+          }
+        }
+      );
+
+      const audioBase64 =
+        data?.output_audio?.data;
+
+      if (!audioBase64) {
+        throw new Error(
+          "Gemini TTS returned no audio data"
+        );
+      }
+
+      const pcm = Buffer.from(
+        audioBase64,
+        "base64"
+      );
+
+      if (!pcm.length) {
+        throw new Error("Generated audio is empty");
+      }
+
+      return createWav(pcm, 24000);
+
+    } catch (error) {
+      lastError = error;
+
+      console.log(
+        `TTS failed attempt ${attempt}: ${error.message}`
+      );
+
+      if (attempt < 3) {
+        await sleep(1500 * attempt);
+      }
+    }
+  }
+
+  throw lastError || new Error("TTS failed");
+}
+
+/* ---------------- JOB PROCESSOR ---------------- */
+
+async function processJob(id) {
+  const job = jobs.get(id);
+
+  if (!job) return;
+
+  try {
+    updateJob(id, {
+      stage: "Creator Agent started",
+      progress: 5,
+      status: "running"
+    });
+
+    await sendTelegram(
+      job.chatId,
+      `🚀 *Creator Agent started*\nJob: ${id}`
+    );
 
     /* SCRIPT */
 
-    job.status = "running";
-    job.progress = 5;
+    updateJob(id, {
+      stage: "Generating original script",
+      progress: 10
+    });
+
+    const generated = await generateScript(job.topic);
+
+    job.model = generated.model;
+    job.rawScript = generated.text;
+
+    updateJob(id, {
+      stage: "Script generated",
+      progress: 40
+    });
 
     await sendTelegram(
       job.chatId,
-      `🤖 Creator Agent started\n\nJob: ${job.id}\nProgress: 5%\n\nGenerating original script...`
-    );
-
-    const generated =
-      await generateScript(
-        job.command
-      );
-
-    job.progress = 40;
-
-    await sendTelegram(
-      job.chatId,
-      `🧠 Script generated\n\nModel: ${generated.model}\nProgress: 40%\n\nRunning quality check...`
+      `📝 Script generated\nModel: ${generated.model}`
     );
 
     /* QUALITY */
 
-    const checked =
-      qualityCheck(generated.text);
+    updateJob(id, {
+      stage: "Quality check",
+      progress: 45
+    });
 
-    if (!checked.passed) {
+    const quality = qualityCheck(generated.text);
+
+    if (!quality.passed) {
       throw new Error(
-        `Quality check failed:\n${checked.errors.join("\n")}`
+        `Quality check failed: ${quality.reason}`
       );
     }
 
-    job.progress = 55;
+    job.title = quality.title;
+    job.description = quality.description;
+    job.script = quality.script;
+    job.words = quality.words;
+
+    updateJob(id, {
+      stage: "Quality check passed",
+      progress: 50
+    });
 
     await sendTelegram(
       job.chatId,
-      `✅ Quality check passed\n\nWords: ${checked.wordCount}\nProgress: 55%\n\n🎙️ Generating AI narration...`
+      `✅ Quality check passed\nWords: ${quality.words}`
     );
 
-    /* VOICE */
+    /* TTS */
 
-    const audio =
-      await generateVoice(
-        checked.script
-      );
-
-    job.progress = 80;
+    updateJob(id, {
+      stage: "Generating AI narration",
+      progress: 55
+    });
 
     await sendTelegram(
       job.chatId,
-      `🎙️ AI voice generated\n\nVoice: ${TTS_VOICE}\nModel: ${TTS_MODEL}\nProgress: 80%\n\nSending test audio...`
+      `🎙️ Generating AI narration...`
     );
 
-    /* SEND AUDIO */
+    const audio = await generateVoice(
+      quality.script
+    );
+
+    job.audioSize = audio.length;
+
+    updateJob(id, {
+      stage: "AI narration generated",
+      progress: 80
+    });
+
+    await sendTelegram(
+      job.chatId,
+      `🎧 AI narration generated\nSending audio...`
+    );
+
+    /* TELEGRAM AUDIO */
 
     await sendAudio(
       job.chatId,
       audio,
-      `🎙️ AI YouTube Autopilot\n\n${checked.title}`
+      `${id}.wav`
     );
 
-    job.status = "completed";
-    job.progress = 100;
-    job.updatedAt =
-      new Date().toISOString();
+    /* COMPLETE */
+
+    updateJob(id, {
+      stage: "Completed",
+      progress: 100,
+      status: "completed",
+      completedAt: new Date().toISOString()
+    });
 
     await sendTelegram(
       job.chatId,
-      `✅ PIPELINE TEST COMPLETED\n\nJob: ${job.id}\n\nScript ✅\nQuality Check ✅\nAI Voice ✅\n\nNext stage: Visuals + Captions + Video Rendering.`
+      `🎉 *Job completed!*
+
+Title:
+${job.title}
+
+Words:
+${job.words}
+
+Model:
+${job.model}
+
+Status:
+✅ Script
+✅ Quality check
+✅ AI narration
+✅ Telegram audio`
     );
 
   } catch (error) {
+    console.error("JOB ERROR:", error);
 
-    job.status = "paused";
-    job.error = error.message;
-    job.updatedAt =
-      new Date().toISOString();
+    const job = jobs.get(id);
+
+    if (job) {
+      job.status = "paused";
+      job.stage = "Paused";
+      job.error = error.message;
+      job.pausedAt = new Date().toISOString();
+    }
 
     await sendTelegram(
       job.chatId,
-      `⚠️ Job paused\n\nJob: ${job.id}\n\nReason:\n${error.message}\n\nNo paid service was charged.`
-    );
+      `⚠️ *Job paused*
+
+Reason:
+${error.message}
+
+💰 No paid service was charged.
+
+Job:
+${id}`
+    ).catch(() => {});
   }
 }
 
 /* ---------------- TELEGRAM COMMANDS ---------------- */
 
 async function handleTelegramMessage(message) {
-  const chatId =
-    message?.chat?.id;
+  const chatId = message?.chat?.id;
+  const text = message?.text?.trim();
 
-  const text =
-    message?.text?.trim();
+  if (!chatId || !text) return;
 
-  if (!chatId || !text) {
-    return;
-  }
+  console.log(
+    `Telegram message from ${chatId}: ${text}`
+  );
 
   if (text === "/start") {
     await sendTelegram(
       chatId,
-      `🤖 AI YouTube Autopilot\n\nCommands:\n\n/create <topic>\n/status\n/jobs`
+      `🤖 *AI YouTube Autopilot*
+
+Commands:
+
+/create <topic>
+/status
+/jobs
+
+Example:
+
+/create 5 surprising facts about space`
     );
+
     return;
   }
 
   if (text === "/status") {
     await sendTelegram(
       chatId,
-      `📊 SYSTEM STATUS\n\nTelegram: ${
-        TELEGRAM_BOT_TOKEN
-          ? "✅"
-          : "❌"
-      }\nGemini: ${
-        GEMINI_API_KEY
-          ? "✅"
-          : "❌"
-      }\n\nScript Agent: ✅\nQuality Check: ✅\nAI Voice: ${
-        GEMINI_API_KEY
-          ? "✅"
-          : "❌"
-      }\n\nTTS Model: ${TTS_MODEL}`
+      `🟢 *System Online*
+
+Creator Agent: Ready
+Gemini: Connected
+Telegram: Connected
+TTS: Ready
+Mode: Free-first`
     );
+
     return;
   }
 
   if (text === "/jobs") {
+    const userJobs = [...jobs.values()]
+      .filter(j => String(j.chatId) === String(chatId))
+      .slice(-10);
 
-    if (jobs.size === 0) {
+    if (!userJobs.length) {
       await sendTelegram(
         chatId,
         "📭 No jobs found."
       );
+
       return;
     }
 
-    let output = "📋 JOBS\n\n";
-
-    for (const job of jobs.values()) {
-      output +=
-        `${job.id}\nStatus: ${job.status}\nProgress: ${job.progress}%\n\n`;
-    }
+    const list = userJobs
+      .map(
+        j =>
+          `• ${j.id}\n  ${j.status} — ${j.progress}%\n  ${j.topic}`
+      )
+      .join("\n\n");
 
     await sendTelegram(
       chatId,
-      output
+      `📋 *Recent Jobs*\n\n${list}`
     );
 
     return;
   }
 
   if (text.startsWith("/create ")) {
+    const topic = text
+      .replace("/create ", "")
+      .trim();
 
-    const command =
-      text.slice(8).trim();
-
-    if (!command) {
+    if (!topic) {
       await sendTelegram(
         chatId,
-        "Example:\n/create 5 surprising facts about space"
+        "❌ Topic missing.\n\nExample:\n/create facts about space"
       );
+
       return;
     }
 
-    const job =
-      createJob(
-        command,
-        chatId
-      );
+    const id = jobId();
+
+    jobs.set(id, {
+      id,
+      chatId,
+      topic,
+      status: "queued",
+      stage: "Job created",
+      progress: 0,
+      createdAt: new Date().toISOString()
+    });
 
     await sendTelegram(
       chatId,
-      `📝 Job created\n\nJob: ${job.id}\nStatus: queued`
+      `🆕 *Job created*
+
+Job:
+${id}
+
+Topic:
+${topic}
+
+Starting Creator Agent...`
     );
 
-    processJob(job);
+    processJob(id).catch(console.error);
 
     return;
   }
 
   await sendTelegram(
     chatId,
-    "Unknown command.\n\nUse /start"
+    `❓ Unknown command.
+
+Use:
+/start
+/status
+/jobs
+/create <topic>`
   );
 }
 
 /* ---------------- TELEGRAM POLLING ---------------- */
 
-let telegramOffset = 0;
-let pollingRunning = false;
+async function telegramPoll() {
+  if (telegramPolling) return;
 
-async function telegramPolling() {
+  telegramPolling = true;
 
-  if (
-    pollingRunning ||
-    !TELEGRAM_BOT_TOKEN
-  ) {
-    return;
-  }
-
-  pollingRunning = true;
-
-  console.log(
-    "Telegram polling enabled"
-  );
+  console.log("Telegram polling enabled");
 
   while (true) {
-
     try {
+      const updates = await telegramRequest(
+        "getUpdates",
+        {
+          offset: telegramOffset,
+          timeout: 25,
+          allowed_updates: ["message"]
+        }
+      );
 
-      const result =
-        await telegram(
-          "getUpdates",
-          {
-            offset:
-              telegramOffset,
-            timeout: 25,
-            allowed_updates:
-              ["message"]
-          }
-        );
+      for (const update of updates) {
+        telegramOffset = update.update_id + 1;
 
-      if (
-        result?.ok &&
-        Array.isArray(
-          result.result
-        )
-      ) {
-
-        for (
-          const update
-          of result.result
-        ) {
-
-          telegramOffset =
-            update.update_id + 1;
-
-          try {
-            await handleTelegramMessage(
-              update.message
-            );
-          } catch (error) {
-            console.error(
-              "Telegram message error:",
-              error.message
-            );
-          }
+        try {
+          await handleTelegramMessage(
+            update.message
+          );
+        } catch (error) {
+          console.error(
+            "Telegram message error:",
+            error
+          );
         }
       }
 
     } catch (error) {
-
       console.error(
         "Telegram polling error:",
         error.message
       );
 
-      await sleep(5000);
+      await sleep(3000);
     }
   }
 }
 
-/* ---------------- SERVER ---------------- */
+/* ---------------- HEALTH ---------------- */
 
 app.get("/", (req, res) => {
   res.json({
-    name:
-      "AI YouTube Autopilot",
+    ok: true,
+    service: "AI YouTube Autopilot",
     status: "online",
-    telegram:
-      Boolean(
-        TELEGRAM_BOT_TOKEN
-      ),
-    gemini:
-      Boolean(
-        GEMINI_API_KEY
-      ),
-    tts: TTS_MODEL
+    time: new Date().toISOString()
   });
 });
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    telegram:
-      Boolean(
-        TELEGRAM_BOT_TOKEN
-      ),
-    gemini:
-      Boolean(
-        GEMINI_API_KEY
-      ),
+    telegram: !!TELEGRAM_BOT_TOKEN,
+    gemini: !!GEMINI_API_KEY,
+    ttsModel: TTS_MODEL,
     jobs: jobs.size
   });
 });
 
-app.get("/api/jobs", (req, res) => {
-  res.json({
-    jobs:
-      Array.from(
-        jobs.values()
-      )
-  });
-});
+/* ---------------- START ---------------- */
 
-app.listen(
-  PORT,
-  () => {
+app.listen(PORT, () => {
+  console.log(
+    `AI YouTube Autopilot listening on port ${PORT}`
+  );
 
-    console.log(
-      `AI YouTube Autopilot listening on ${PORT}`
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.error(
+      "TELEGRAM_BOT_TOKEN is missing"
     );
-
-    console.log(
-      `Gemini configured: ${Boolean(
-        GEMINI_API_KEY
-      )}`
-    );
-
-    console.log(
-      `Telegram configured: ${Boolean(
-        TELEGRAM_BOT_TOKEN
-      )}`
-    );
-
-    telegramPolling();
   }
-);
+
+  if (!GEMINI_API_KEY) {
+    console.error(
+      "GEMINI_API_KEY is missing"
+    );
+  }
+
+  if (TELEGRAM_BOT_TOKEN) {
+    telegramPoll().catch(console.error);
+  }
+});
