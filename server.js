@@ -41,6 +41,7 @@ async function db(query, params = []) {
 ========================= */
 
 async function initDatabase() {
+  await db("DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='job_audio_chunks' AND column_name='audio') THEN ALTER TABLE job_audio_chunks ALTER COLUMN audio DROP NOT NULL; END IF; END $$;");
   console.log("Starting PostgreSQL database initialization...");
 
   await db(`
