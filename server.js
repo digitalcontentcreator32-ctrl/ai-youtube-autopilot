@@ -1,5 +1,9 @@
 import express from "express";
 import pg from "pg";
+import { spawn } from "node:child_process";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const { Pool } = pg;
 const app = express();
@@ -41,7 +45,6 @@ async function db(query, params = []) {
 ========================= */
 
 async function initDatabase() {
-  await db("DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='job_audio_chunks' AND column_name='audio') THEN ALTER TABLE job_audio_chunks ALTER COLUMN audio DROP NOT NULL; END IF; END $$;");
   console.log("Starting PostgreSQL database initialization...");
 
   await db(`
@@ -192,26 +195,6 @@ async function initDatabase() {
   await db(`
     ALTER TABLE job_audio_chunks
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
-  `);
-
-  /* =========================
-     LEGACY AUDIO COLUMN FIX
-  ========================= */
-
-  await db(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'job_audio_chunks'
-          AND column_name = 'audio'
-      ) THEN
-        ALTER TABLE job_audio_chunks
-        ALTER COLUMN audio DROP NOT NULL;
-      END IF;
-    END $$;
   `);
 
   /* =========================
@@ -413,7 +396,6 @@ async function geminiRequest(
         headers: {
           "Content-Type": "application/json",
           "x-goog-api-key": GEMINI_API_KEY,
-          "Api-Revision": "2026-05-20",
         },
         body: JSON.stringify(body),
         signal: controller.signal,
@@ -590,7 +572,7 @@ function qualityCheck(script) {
 
 function splitIntoChunks(
   text,
-  maxWords = 120
+  maxWords = 450
 ) {
   const clean = String(text || "")
     .replace(/\s+/g, " ")
@@ -655,68 +637,209 @@ function splitIntoChunks(
 
 async function generateTTSChunk(text, model) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 120000);
+  const timeoutMs = 120000;
+
+  const timer = setTimeout(
+    () => controller.abort(),
+    timeoutMs
+  );
+
   try {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+      "https://generativelanguage.googleapis.com/v1beta/interactions",
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY
+          "x-goog-api-key": GEMINI_API_KEY,
         },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: `Read this narration aloud naturally. Only synthesize the narration:\n\n${text}` }] }],
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: "Kore" }
-              }
-            }
-          }
+          model,
+          input: text,
+          response_format: {
+            type: "audio",
+            mime_type: "audio/wav",
+            delivery: "inline",
+          },
+          generation_config: {
+            speech_config: [
+              {
+                voice: "Kore",
+                language: "en-US",
+              },
+            ],
+          },
         }),
-        signal: controller.signal
+        signal: controller.signal,
       }
     );
+
     const raw = await response.text();
-    if (!response.ok) throw new Error(`TTS ${response.status}: ${raw}`);
+
+    if (!response.ok) {
+      const error = new Error(
+        `TTS ${response.status}: ${raw}`
+      );
+
+      error.status = response.status;
+
+      throw error;
+    }
+
     const result = JSON.parse(raw);
-    const audioData = result?.candidates?.[0]?.content?.parts?.find(
-      part => part?.inlineData?.data
-    )?.inlineData?.data;
-    if (!audioData) throw new Error("TTS returned no audio data");
-    const pcm = Buffer.from(audioData, "base64");
-    const buffer = isWav(pcm) ? pcm : pcmToWav(pcm, 24000, 1, 16);
-    if (!isWav(buffer)) throw new Error("Invalid WAV output");
-    return { buffer, mimeType: "audio/wav", sampleRate: 24000 };
+
+    // IMPORTANT:
+    // This is a REST call. `output_audio` is an SDK convenience
+    // property and is not the raw REST response field.
+    const audioOutput = Array.isArray(result?.outputs)
+      ? result.outputs.find(
+          (output) => output?.type === "audio"
+        )
+      : null;
+
+    const audioData = audioOutput?.data;
+
+    if (!audioData) {
+      throw new Error(
+        `TTS returned no audio data. REST response keys: ${Object.keys(result || {}).join(", ")}`
+      );
+    }
+
+    const buffer = Buffer.from(audioData, "base64");
+
+    if (!isWav(buffer)) {
+      throw new Error(
+        `TTS returned non-WAV audio (${audioOutput?.mime_type || "unknown MIME type"})`
+      );
+    }
+
+    return {
+      buffer,
+      mimeType:
+        audioOutput?.mime_type ||
+        "audio/wav",
+      sampleRate:
+        audioOutput?.sample_rate ||
+        24000,
+    };
+  } catch (error) {
+    if (error.name === "AbortError") {
+      const e = new Error(
+        `TTS_REQUEST_TIMEOUT_${timeoutMs}MS`
+      );
+
+      e.code = "TIMEOUT";
+
+      throw e;
+    }
+
+    throw error;
   } finally {
     clearTimeout(timer);
   }
 }
 
+async function generateLocalPiperTTS(text) {
+  const workDir = await mkdtemp(join(tmpdir(), "autopilot-piper-"));
+  const outputFile = join(workDir, "speech.wav");
+  const model = process.env.PIPER_MODEL || "en_US-lessac-medium";
+  const python = process.env.PIPER_PYTHON || "python3";
+
+  try {
+    console.log(`TTS fallback: local Piper model=${model}`);
+
+    await new Promise((resolve, reject) => {
+      const child = spawn(
+        python,
+        ["-m", "piper", "--model", model, "--output_file", outputFile],
+        { stdio: ["pipe", "pipe", "pipe"] }
+      );
+
+      let stderr = "";
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk.toString();
+      });
+
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (code === 0) return resolve();
+        reject(new Error(`Piper exited with code ${code}: ${stderr.slice(-2000)}`));
+      });
+
+      child.stdin.end(text);
+    });
+
+    const buffer = await readFile(outputFile);
+
+    if (!isWav(buffer)) {
+      throw new Error("Piper returned invalid WAV audio");
+    }
+
+    return {
+      buffer,
+      mimeType: "audio/wav",
+      sampleRate: 22050,
+      model: `piper:${model}`,
+    };
+  } finally {
+    await rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function generateTTSWithRetry(text) {
   let lastError;
-  const model=TTS_MODELS[0];
 
-  for(let attempt=1;attempt<=2;attempt++){
-    try{
-      console.log(`TTS request: model=${model}, attempt=${attempt}, words=${text.split(/\s+/).length}`);
-      return {...(await generateTTSChunk(text,model)),model};
-    }catch(error){
-      lastError=error;
-      console.log(`TTS failed: model=${model}, attempt=${attempt}, error=${error.message}`);
+  // IMPORTANT: 429/quota errors are never retried against the same
+  // Gemini model. A different Gemini model may share the same project
+  // quota, so quota exhaustion falls through immediately to local Piper.
+  for (const model of TTS_MODELS) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        console.log(
+          `TTS request: model=${model}, attempt=${attempt}, words=${text.split(/\s+/).length}`
+        );
 
-      if(error.status===400 || error.status===403 || error.status===429) break;
+        return {
+          ...(await generateTTSChunk(text, model)),
+          model,
+        };
+      } catch (error) {
+        lastError = error;
 
-      if(error.code==="TIMEOUT" || [500,502,503].includes(error.status)){
-        if(attempt<2) await sleep(5000+Math.floor(Math.random()*3000));
-        else break;
-      }else break;
+        console.log(
+          `TTS failed: model=${model}, attempt=${attempt}, status=${error.status || "none"}, code=${error.code || "none"}, error=${error.message}`
+        );
+
+        if (error.status === 429) {
+          console.log(`Gemini quota/rate limit hit; skipping remaining Gemini retries for ${model}.`);
+          break;
+        }
+
+        const retryable =
+          error.code === "TIMEOUT" ||
+          error.status === 500 ||
+          error.status === 502 ||
+          error.status === 503;
+
+        if (!retryable || attempt === 2) break;
+
+        const wait = 4000 + Math.floor(Math.random() * 5000);
+        await sleep(wait);
+      }
     }
   }
 
-  throw lastError || new Error("All TTS models failed");
+  // Legal/local fallback: no API key, no paid request, no quota bypass.
+  try {
+    return await generateLocalPiperTTS(text);
+  } catch (fallbackError) {
+    const combined = new Error(
+      `All remote TTS providers unavailable. Gemini: ${lastError?.message || "unknown"}. Local Piper: ${fallbackError.message}`
+    );
+    combined.code = "TTS_ALL_PROVIDERS_FAILED";
+    combined.cause = fallbackError;
+    throw combined;
+  }
 }
 
 /* =========================
@@ -940,7 +1063,7 @@ async function processTTS(
 ) {
   const chunks = splitIntoChunks(
     job.script,
-    120
+    450
   );
 
   if (!chunks.length) {
@@ -1288,6 +1411,10 @@ Progress: 50%`
     status: "running",
     error: null,
   });
+
+  // Refresh after status updates so resume/restart always uses the
+  // latest persisted script and chat_id.
+  job = await getJob(id);
 
   await sendMessage(
     targetChat,
@@ -1777,6 +1904,41 @@ async function startup() {
         console.log(
           "STARTUP COMPLETE"
         );
+
+        // Resume jobs that were queued/recovered during a previous
+        // process lifetime. Existing completed TTS chunks are reused.
+        setTimeout(async () => {
+          try {
+            const queued = await db(`
+              SELECT id, chat_id
+              FROM jobs
+              WHERE status = 'queued'
+              ORDER BY created_at ASC
+              LIMIT 10
+            `);
+
+            for (const row of queued.rows) {
+              processJob(row.id, row.chat_id).catch(async (error) => {
+                await updateJob(row.id, {
+                  status: "paused",
+                  error: error.message,
+                }).catch(() => {});
+
+                await sendMessage(
+                  row.chat_id,
+                  `⏸️ JOB PAUSED SAFELY
+
+Reason: ${error.message}
+
+Resume with:
+/resume ${row.id}`
+                ).catch(() => {});
+              });
+            }
+          } catch (error) {
+            console.error("Queued-job recovery failed:", error);
+          }
+        }, 1000);
 
       }
     );

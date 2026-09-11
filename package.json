@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "python3 -m pip install --user --disable-pip-version-check piper-tts"
   },
   "dependencies": {
     "express": "^5.1.0",
