@@ -745,48 +745,26 @@ async function generateTTSChunk(
 }
 async function generateTTSWithRetry(text) {
   let lastError;
+  const model=TTS_MODELS[0];
 
-  for (const model of TTS_MODELS) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        console.log(
-          `TTS request: model=${model}, attempt=${attempt}, words=${text.split(/\s+/).length}`
-        );
+  for(let attempt=1;attempt<=2;attempt++){
+    try{
+      console.log(`TTS request: model=${model}, attempt=${attempt}, words=${text.split(/\s+/).length}`);
+      return {...(await generateTTSChunk(text,model)),model};
+    }catch(error){
+      lastError=error;
+      console.log(`TTS failed: model=${model}, attempt=${attempt}, error=${error.message}`);
 
-        return {
-          ...(await generateTTSChunk(text, model)),
-          model,
-        };
-      } catch (error) {
-        lastError = error;
+      if(error.status===400 || error.status===403 || error.status===429) break;
 
-        console.log(
-          `TTS failed: model=${model}, attempt=${attempt}, error=${error.message}`
-        );
-
-        const retryable =
-          error.code === "TIMEOUT" ||
-          error.status === 429 ||
-          error.status === 500 ||
-          error.status === 502 ||
-          error.status === 503;
-
-        if (!retryable) break;
-
-        if (attempt < 2) {
-          const wait =
-            4000 + Math.floor(Math.random() * 5000);
-
-          await sleep(wait);
-        }
-      }
+      if(error.code==="TIMEOUT" || [500,502,503].includes(error.status)){
+        if(attempt<2) await sleep(5000+Math.floor(Math.random()*3000));
+        else break;
+      }else break;
     }
   }
 
-  throw (
-    lastError ||
-    new Error("All TTS models failed")
-  );
+  throw lastError || new Error("All TTS models failed");
 }
 
 /* =========================
