@@ -107,7 +107,7 @@ async function handleTelegramUpdate(update) {
   if (text === "/start") {
     await sendMessage(
       chatId,
-      "AI YouTube Autopilot connected!\\n\\n/status - system status\\n/create <request> - create Creator Agent job\\n/stop - emergency stop"
+      "AI YouTube Autopilot connected!\n\n/status - system status\\n/create <request> - create Creator Agent job\\n/stop - emergency stop"
     );
     return;
   }
@@ -150,7 +150,7 @@ async function handleTelegramUpdate(update) {
 
     await sendMessage(
       chatId,
-      `Request saved ✅\\nJob: ${job.id}\\nStatus: QUEUED`
+      `Request saved ✅\nJob: ${job.id}\nStatus: QUEUED`
     );
   }
 }
