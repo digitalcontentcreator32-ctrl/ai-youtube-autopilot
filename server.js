@@ -195,6 +195,26 @@ async function initDatabase() {
   `);
 
   /* =========================
+     LEGACY AUDIO COLUMN FIX
+  ========================= */
+
+  await db(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'job_audio_chunks'
+          AND column_name = 'audio'
+      ) THEN
+        ALTER TABLE job_audio_chunks
+        ALTER COLUMN audio DROP NOT NULL;
+      END IF;
+    END $$;
+  `);
+
+  /* =========================
      DEFAULT VALUES
   ========================= */
 
@@ -662,13 +682,11 @@ async function generateTTSChunk(
             mime_type: "audio/wav",
           },
           generation_config: {
-            speech_config: {
-              voice_config: {
-                prebuilt_voice_config: {
-                  voice_name: "Kore",
-                },
+            speech_config: [
+              {
+                voice: "Kore",
               },
-            },
+            ],
           },
         }),
         signal: controller.signal,
