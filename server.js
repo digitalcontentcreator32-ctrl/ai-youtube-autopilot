@@ -2220,6 +2220,119 @@ Payment mode: APPROVAL ONLY`
    TELEGRAM WEBHOOK
 ========================= */
 
+
+/* CONVERSATIONAL_YOUTUBE_MANAGER_V1 */
+
+/*
+  Natural-language Telegram manager.
+  Read-only questions are handled directly.
+  Destructive/paid actions must still use explicit approval.
+*/
+
+async function conversationalManager(chatId, text) {
+  const q = String(text || "").trim();
+  if (!q) return false;
+
+  const lower = q.toLowerCase();
+
+  const asksStatus =
+    /channel|video|performance|analytics|views|watch time|ctr|retention|subscriber|subscribers|traffic|algorithm|thumbnail|title/.test(lower);
+
+  const asksHelp =
+    /kya karna|kya sahi|kya galat|next|ab kya|aage kya|fayda|benefit|check karo|batao/.test(lower);
+
+  if (!asksStatus && !asksHelp) return false;
+
+  let latest = null;
+
+  try {
+    const result = await db(`
+      SELECT id, topic, status, progress, stage,
+             tts_total_chunks, tts_completed_chunks,
+             created_at, updated_at
+      FROM jobs
+      WHERE chat_id = $1
+      ORDER BY created_at DESC
+      LIMIT 10
+    `, [chatId]);
+
+    latest = result.rows;
+  } catch (error) {
+    console.log("Conversational manager DB read:", error.message);
+  }
+
+  const jobSummary = latest?.length
+    ? latest.map((j, i) =>
+        `${i + 1}. ${j.topic} — ${j.status}, ${j.progress}% (${j.stage})`
+      ).join("\n")
+    : "Abhi koi recent job nahi mili.";
+
+  const prompt = `
+You are the YouTube Manager for an AI YouTube automation system.
+
+The user is talking naturally in Hindi/Hinglish.
+Answer naturally. Never require command syntax.
+
+USER:
+${q}
+
+RECENT AUTOMATION JOBS:
+${jobSummary}
+
+RULES:
+- Do not claim secret knowledge of the YouTube algorithm.
+- Explain recommendations using observable metrics and reasonable YouTube best practices.
+- If actual YouTube Analytics data is not connected/available, clearly say that you can only assess the automation/job data currently available.
+- Never invent views, CTR, retention, revenue, subscribers, impressions, traffic sources or other analytics.
+- Give practical next steps.
+- Keep the answer concise but useful.
+- Publishing, deleting, spending money or changing important settings requires explicit user approval.
+- Do not say an action was completed unless the system actually completed it.
+`;
+
+  try {
+    const model = SCRIPT_MODELS[0];
+
+    const result = await retryGemini(
+      model,
+      {
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: prompt }]
+          }
+        ],
+        generationConfig: {
+          temperature: 0.4,
+          maxOutputTokens: 1200
+        }
+      },
+      45000,
+      2
+    );
+
+    const answer = result?.candidates?.[0]?.content?.parts
+      ?.map(part => part.text || "")
+      .join("")
+      .trim();
+
+    if (answer) {
+      await sendMessage(chatId, answer);
+      return true;
+    }
+  } catch (error) {
+    console.log("Conversational manager error:", error.message);
+    await sendMessage(
+      chatId,
+      "Main abhi analysis complete nahi kar paaya. Automation jobs ka status available hai, lekin detailed channel analytics ke liye YouTube Analytics connection zaroori hoga."
+    );
+    return true;
+  }
+
+  return false;
+}
+
+
 app.post(
   "/telegram/webhook",
   async (req, res) => {
@@ -2245,6 +2358,11 @@ app.post(
 
       const message =
         req.body?.message;
+      if (chatId && text) {
+        const handledConversationally =
+          await conversationalManager(chatId, text);
+        if (handledConversationally) return;
+      }
 
       if (
         !message?.chat?.id ||
