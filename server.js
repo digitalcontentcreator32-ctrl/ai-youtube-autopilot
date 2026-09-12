@@ -514,6 +514,140 @@ ${JSON.stringify(jobContext)}`
 /* TELEGRAM_MANAGER_V3_END */
 
 
+
+/* DIRECT_RESUME_HANDLER_V1_START */
+
+/*
+  Direct /resume handler.
+  It runs before the conversational manager so slash commands
+  cannot be swallowed by another Telegram route.
+*/
+app.use(async (req, res, next) => {
+  try {
+    if (req.method !== "POST") {
+      return next();
+    }
+
+    const update = req.body;
+    const message =
+      update?.message ||
+      update?.edited_message ||
+      update?.channel_post;
+
+    const chatId = message?.chat?.id;
+    const text = String(message?.text || "").trim();
+
+    if (!chatId || !text) {
+      return next();
+    }
+
+    const match = text.match(
+      /^\/resume(?:@\w+)?\s+([A-Za-z0-9_-]+)$/i
+    );
+
+    if (!match) {
+      return next();
+    }
+
+    const jobId = match[1];
+
+    const result = await db(
+      `
+      SELECT
+        id,
+        topic,
+        status,
+        progress,
+        stage,
+        error,
+        tts_total_chunks,
+        tts_completed_chunks
+      FROM jobs
+      WHERE id = $1
+        AND chat_id = $2
+      LIMIT 1
+      `,
+      [jobId, chatId]
+    );
+
+    if (!result.rows.length) {
+      await sendMessage(
+        chatId,
+        `❌ Job nahi mili.\n\n🆔 ${jobId}`
+      );
+
+      return res.sendStatus(200);
+    }
+
+    const job = result.rows[0];
+
+    if (job.status === "completed") {
+      await sendMessage(
+        chatId,
+        `✅ Ye job already complete hai.\n\n🎯 ${job.topic}\n📈 Progress: ${job.progress}%`
+      );
+
+      return res.sendStatus(200);
+    }
+
+    if (job.status === "running") {
+      await sendMessage(
+        chatId,
+        `🔄 Ye job already chal rahi hai.\n\n🎯 ${job.topic}\n📈 Progress: ${job.progress}%\n🔧 Stage: ${job.stage || "unknown"}`
+      );
+
+      return res.sendStatus(200);
+    }
+
+    if (!["paused", "queued"].includes(job.status)) {
+      await sendMessage(
+        chatId,
+        `ℹ️ Job abhi "${job.status}" state mein hai.\n\n🎯 ${job.topic}\n📈 Progress: ${job.progress}%`
+      );
+
+      return res.sendStatus(200);
+    }
+
+    await sendMessage(
+      chatId,
+      `▶️ Resume kar raha hoon.\n\n🎯 ${job.topic}\n🆔 ${job.id}\n\n💾 Saved work reuse hoga.`
+    );
+
+    /*
+      Resume asynchronously so Telegram gets an immediate
+      acknowledgement instead of waiting for the full job.
+    */
+    resumeJob(job.id, chatId).catch(async error => {
+      console.log(
+        "Direct resume handler error:",
+        error.message
+      );
+
+      await updateJob(job.id, {
+        status: "paused",
+        error: error.message
+      }).catch(() => {});
+
+      await sendMessage(
+        chatId,
+        `⏸️ Job safely paused again.\n\n🆔 ${job.id}\n⚠️ ${String(error.message).slice(0, 500)}`
+      ).catch(() => {});
+    });
+
+    return res.sendStatus(200);
+  } catch (error) {
+    console.log(
+      "Direct resume handler failure:",
+      error.message
+    );
+
+    return next();
+  }
+});
+
+/* DIRECT_RESUME_HANDLER_V1_END */
+
+
 /* TELEGRAM_FAST_INTERCEPT_V1 */
 
 /*
