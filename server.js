@@ -2221,29 +2221,224 @@ Payment mode: APPROVAL ONLY`
 ========================= */
 
 
-/* CONVERSATIONAL_YOUTUBE_MANAGER_V1 */
+/* CONVERSATIONAL_YOUTUBE_MANAGER_V2 */
 
 /*
-  Natural-language Telegram manager.
-  Read-only questions are handled directly.
-  Destructive/paid actions must still use explicit approval.
+  FAST CONVERSATIONAL MANAGER
+
+  Fast path:
+  - time/date questions: local calculation, no Gemini
+  - simple job/status questions: PostgreSQL only
+  - news: fresh Google News RSS, no unnecessary AI delay
+  - complex analysis: Gemini
 */
+
+function fastTimeAnswer(text) {
+  const q = String(text || "").toLowerCase().trim();
+
+  const asksTime =
+    /\b(time|samay|kitne baje|baje|waqt)\b/.test(q);
+
+  const asksDate =
+    /\b(date|today|aaj|kal|tomorrow|day|din)\b/.test(q);
+
+  if (!asksTime && !asksDate) return null;
+
+  let zone = "Asia/Kolkata";
+
+  if (/\busa\b|\bunited states\b|\bnew york\b|\best\b/.test(q)) {
+    zone = "America/New_York";
+  } else if (/\blos angeles\b|\bcalifornia\b|\bpst\b/.test(q)) {
+    zone = "America/Los_Angeles";
+  } else if (/\blondon\b|\buk\b|\bgmt\b/.test(q)) {
+    zone = "Europe/London";
+  } else if (/\bdubai\b|\buae\b/.test(q)) {
+    zone = "Asia/Dubai";
+  }
+
+  const now = new Date();
+
+  const parts = new Intl.DateTimeFormat("en-IN", {
+    timeZone: zone,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+    weekday: "long",
+    hour12: true
+  }).formatToParts(now);
+
+  const get = (type) =>
+    parts.find(p => p.type === type)?.value || "";
+
+  const time = `${get("hour")}:${get("minute")}:${get("second")} ${get("dayPeriod")}`;
+  const date = `${get("weekday")}, ${get("day")} ${get("month")} ${get("year")}`;
+
+  if (asksTime && asksDate) {
+    return `🕒 ${time}\n📅 ${date}\n🌍 ${zone}`;
+  }
+
+  if (asksTime) {
+    return `🕒 Abhi ${time} hai.\n🌍 ${zone}`;
+  }
+
+  return `📅 Aaj ${date} hai.`;
+}
+
+function isNewsQuestion(text) {
+  return /\b(news|khabar|khabrein|latest|breaking|headlines|aaj ki khabar|latest news|current news)\b/i
+    .test(String(text || ""));
+}
+
+async function getFastNews(chatId, text) {
+  try {
+    const query = String(text || "")
+      .replace(/\b(latest|news|khabar|khabrein|breaking|headlines|aaj ki)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const rssUrl =
+      "https://news.google.com/rss/search?q=" +
+      encodeURIComponent(query || "India") +
+      "&hl=en-IN&gl=IN&ceid=IN:en";
+
+    const response = await fetch(rssUrl, {
+      headers: { "User-Agent": "AI-YouTube-Autopilot/2.0" }
+    });
+
+    if (!response.ok) {
+      throw new Error(`News RSS ${response.status}`);
+    }
+
+    const xml = await response.text();
+
+    const items = [...xml.matchAll(
+      /<item>([\s\S]*?)<\/item>/gi
+    )].slice(0, 5);
+
+    if (!items.length) {
+      await sendMessage(
+        chatId,
+        "Abhi fresh news result nahi mila. Main galat khabar guess nahi karunga."
+      );
+      return true;
+    }
+
+    const clean = (v) =>
+      v
+        .replace(/<!\[CDATA\[|\]\]>/g, "")
+        .replace(/<[^>]+>/g, "")
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .trim();
+
+    const headlines = items.map((m, i) => {
+      const block = m[1];
+      const title = clean(
+        (block.match(/<title>([\s\S]*?)<\/title>/i) || [,""])[1]
+      );
+      const source = clean(
+        (block.match(/<source[^>]*>([\s\S]*?)<\/source>/i) || [,""])[1]
+      );
+
+      return `${i + 1}. ${title}${source ? ` — ${source}` : ""}`;
+    });
+
+    await sendMessage(
+      chatId,
+      `📰 Fresh news:\n\n${headlines.join("\n")}\n\n_Source: Google News RSS; headlines are current-source results, not invented summaries._`
+    );
+
+    return true;
+  } catch (error) {
+    console.log("Fast news error:", error.message);
+
+    await sendMessage(
+      chatId,
+      "Fresh news source abhi respond nahi kar raha. Main bina verify kiye news nahi bataunga."
+    );
+
+    return true;
+  }
+}
 
 async function conversationalManager(chatId, text) {
   const q = String(text || "").trim();
   if (!q) return false;
 
+  /*
+    1. TIME / DATE = instant
+  */
+  const timeAnswer = fastTimeAnswer(q);
+
+  if (timeAnswer) {
+    await sendMessage(chatId, timeAnswer);
+    return true;
+  }
+
+  /*
+    2. NEWS = fresh source first
+  */
+  if (isNewsQuestion(q)) {
+    return getFastNews(chatId, q);
+  }
+
+  /*
+    3. SIMPLE AUTOMATION STATUS = database only
+       No Gemini delay.
+  */
   const lower = q.toLowerCase();
 
-  const asksStatus =
-    /channel|video|performance|analytics|views|watch time|ctr|retention|subscriber|subscribers|traffic|algorithm|thumbnail|title/.test(lower);
+  const simpleStatus =
+    /^(status|job status|mera status|mere jobs|video status|kya chal raha|abhi kya chal raha|progress|kitna hua)/i
+      .test(q);
 
-  const asksHelp =
-    /kya karna|kya sahi|kya galat|next|ab kya|aage kya|fayda|benefit|check karo|batao/.test(lower);
+  if (simpleStatus) {
+    try {
+      const result = await db(`
+        SELECT id, topic, status, progress, stage,
+               tts_total_chunks, tts_completed_chunks
+        FROM jobs
+        WHERE chat_id = $1
+        ORDER BY created_at DESC
+        LIMIT 5
+      `, [chatId]);
 
-  if (!asksStatus && !asksHelp) return false;
+      if (!result.rows.length) {
+        await sendMessage(chatId, "Abhi aapke chat se koi recent job nahi mili.");
+        return true;
+      }
 
-  let latest = null;
+      const lines = result.rows.map((j, i) =>
+        `${i + 1}. ${j.topic}\n   ${j.status} • ${j.progress || 0}% • ${j.stage || "queued"}`
+      );
+
+      await sendMessage(
+        chatId,
+        `📊 Current status:\n\n${lines.join("\n\n")}`
+      );
+
+      return true;
+    } catch (error) {
+      console.log("Fast status error:", error.message);
+    }
+  }
+
+  /*
+    4. Only complex questions go to Gemini.
+  */
+  const asksAnalysis =
+    /channel|video|performance|analytics|views|watch time|ctr|retention|subscriber|traffic|algorithm|thumbnail|title|script|kya sahi|kya galat|next|aage|fayda|benefit|check karo/i
+      .test(lower);
+
+  if (!asksAnalysis) return false;
+
+  let latest = [];
 
   try {
     const result = await db(`
@@ -2261,40 +2456,35 @@ async function conversationalManager(chatId, text) {
     console.log("Conversational manager DB read:", error.message);
   }
 
-  const jobSummary = latest?.length
+  const jobSummary = latest.length
     ? latest.map((j, i) =>
         `${i + 1}. ${j.topic} — ${j.status}, ${j.progress}% (${j.stage})`
       ).join("\n")
-    : "Abhi koi recent job nahi mili.";
+    : "No recent automation jobs.";
 
   const prompt = `
 You are the YouTube Manager for an AI YouTube automation system.
 
-The user is talking naturally in Hindi/Hinglish.
-Answer naturally. Never require command syntax.
-
 USER:
 ${q}
 
-RECENT AUTOMATION JOBS:
+RECENT JOBS:
 ${jobSummary}
 
 RULES:
-- Do not claim secret knowledge of the YouTube algorithm.
-- Explain recommendations using observable metrics and reasonable YouTube best practices.
-- If actual YouTube Analytics data is not connected/available, clearly say that you can only assess the automation/job data currently available.
-- Never invent views, CTR, retention, revenue, subscribers, impressions, traffic sources or other analytics.
+- Reply naturally in Hindi/Hinglish.
+- Be concise and useful.
+- Do not claim secret YouTube algorithm knowledge.
+- Never invent analytics numbers.
+- If YouTube Analytics data is not connected, say so.
 - Give practical next steps.
-- Keep the answer concise but useful.
-- Publishing, deleting, spending money or changing important settings requires explicit user approval.
-- Do not say an action was completed unless the system actually completed it.
+- Never publish, delete, spend money or change important settings without explicit approval.
+- Never claim an action completed unless it actually completed.
 `;
 
   try {
-    const model = SCRIPT_MODELS[0];
-
     const result = await retryGemini(
-      model,
+      SCRIPT_MODELS[0],
       {
         contents: [
           {
@@ -2303,12 +2493,12 @@ RULES:
           }
         ],
         generationConfig: {
-          temperature: 0.4,
-          maxOutputTokens: 1200
+          temperature: 0.3,
+          maxOutputTokens: 700
         }
       },
-      45000,
-      2
+      30000,
+      1
     );
 
     const answer = result?.candidates?.[0]?.content?.parts
@@ -2321,190 +2511,18 @@ RULES:
       return true;
     }
   } catch (error) {
-    console.log("Conversational manager error:", error.message);
+    console.log("Fast conversational analysis error:", error.message);
+
     await sendMessage(
       chatId,
-      "Main abhi analysis complete nahi kar paaya. Automation jobs ka status available hai, lekin detailed channel analytics ke liye YouTube Analytics connection zaroori hoga."
+      "Analysis service abhi busy hai. Main bina verify kiye answer nahi dunga."
     );
+
     return true;
   }
 
   return false;
 }
-
-
-app.post(
-  "/telegram/webhook",
-  async (req, res) => {
-
-    // Respond immediately so Telegram
-    // does not resend the same update.
-    res.sendStatus(200);
-
-    try {
-
-      if (
-        WEBHOOK_SECRET &&
-        req.get(
-          "X-Telegram-Bot-Api-Secret-Token"
-        ) !== WEBHOOK_SECRET
-      ) {
-        console.log(
-          "Rejected Telegram webhook: invalid secret"
-        );
-
-        return;
-      }
-
-      const message =
-        req.body?.message;
-      if (chatId && text) {
-        const handledConversationally =
-          await conversationalManager(chatId, text);
-        if (handledConversationally) return;
-      }
-
-      if (
-        !message?.chat?.id ||
-        !message?.text
-      ) {
-        return;
-      }
-
-      const chatId =
-        message.chat.id;
-
-      const text =
-        message.text.trim();
-
-      /* =====================
-         /start
-      ===================== */
-
-      if (text === "/start") {
-
-        await sendMessage(
-          chatId,
-          `🤖 AI YouTube Autopilot
-
-ONLINE ✅
-
-Commands:
-
-/create <topic>
-
-/status
-
-/resume <job_id>
-
-Example:
-
-/create 5 surprising facts about space`
-        );
-
-        return;
-      }
-
-      /* =====================
-         /status
-      ===================== */
-
-      if (text === "/status") {
-
-        await status(
-          chatId
-        );
-
-        return;
-      }
-
-      /* =====================
-         /create
-      ===================== */
-
-      if (
-        text.startsWith("/create ")
-      ) {
-
-        const topic =
-          text
-            .substring(8)
-            .trim();
-
-        if (!topic) {
-
-          await sendMessage(
-            chatId,
-            "Use: /create <topic>"
-          );
-
-          return;
-        }
-
-        await createJob(
-          topic,
-          chatId
-        );
-
-        return;
-      }
-
-      /* =====================
-         /resume
-      ===================== */
-
-      if (
-        text.startsWith("/resume ")
-      ) {
-
-        const id =
-          text
-            .substring(8)
-            .trim();
-
-        if (!id) {
-
-          await sendMessage(
-            chatId,
-            "Use: /resume <job_id>"
-          );
-
-          return;
-        }
-
-        await resumeJob(
-          id,
-          chatId
-        );
-
-        return;
-      }
-
-      /* =====================
-         UNKNOWN COMMAND
-      ===================== */
-
-      await sendMessage(
-        chatId,
-        `Unknown command.
-
-Use:
-
-/start
-/create <topic>
-/status
-/resume <job_id>`
-      );
-
-    } catch (error) {
-
-      console.error(
-        "Webhook processing error:",
-        error
-      );
-    }
-  }
-);
 
 /* =========================
    HEALTH CHECK
