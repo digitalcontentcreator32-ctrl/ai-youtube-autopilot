@@ -2691,11 +2691,6 @@ async function startup() {
     // was running, put it back into
     // queued state instead of losing it.
 
-    /*
-      ROOT FIX: never re-queue a freshly running job on every
-      Render restart. Only recover jobs that have been genuinely
-      stale for at least 30 minutes.
-    */
     const recovery =
       await db(`
         UPDATE jobs
@@ -2703,12 +2698,11 @@ async function startup() {
           status = 'queued',
           updated_at = NOW()
         WHERE status = 'running'
-          AND updated_at < NOW() - INTERVAL '30 minutes'
         RETURNING id
       `);
 
     console.log(
-      `Recovered ${recovery.rows.length} genuinely stale job(s) to queued state`
+      `Recovered ${recovery.rows.length} interrupted job(s) to queued state`
     );
 
     /* =====================
