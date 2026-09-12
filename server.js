@@ -11,6 +11,67 @@ const app = express();
 
 app.use(express.json({ limit: "2mb" }));
 
+/* TELEGRAM_FAST_INTERCEPT_V1 */
+
+/*
+  This middleware runs before the older Telegram route.
+  It guarantees that simple conversational messages reach
+  conversationalManager first.
+*/
+app.use(async (req, res, next) => {
+  try {
+    if (req.method !== "POST") {
+      return next();
+    }
+
+    const update = req.body;
+
+    const message =
+      update?.message ||
+      update?.edited_message ||
+      update?.channel_post;
+
+    const chatId = message?.chat?.id;
+    const text = message?.text;
+
+    if (!chatId || !text) {
+      return next();
+    }
+
+    /*
+      conversationalManager handles:
+      - time/date locally
+      - news via fresh source
+      - simple status via PostgreSQL
+      - complex questions via Gemini
+    */
+    if (typeof conversationalManager === "function") {
+      const handled = await conversationalManager(
+        chatId,
+        String(text)
+      );
+
+      if (handled) {
+        return res.sendStatus(200);
+      }
+    }
+
+    return next();
+  } catch (error) {
+    console.log(
+      "Telegram fast intercept error:",
+      error.message
+    );
+
+    /*
+      Never break the original Telegram route because
+      of the conversational layer.
+    */
+    return next();
+  }
+});
+
+
 const PORT = process.env.PORT || 10000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -353,12 +414,44 @@ async function telegram(method, body = {}) {
   return data.result;
 }
 
+
+const PROGRESS_DEDUPE_V1 = new Map();
+
 async function sendMessage(chatId, text) {
   if (!chatId) return;
 
+  const messageText = String(text || "");
+
+  /*
+    Progress updates are useful, but identical progress messages
+    arriving repeatedly create Telegram spam.
+    Keep a short per-chat dedupe window.
+  */
+  if (/Progress:\s*\d+%/i.test(messageText)) {
+    const key = `${chatId}:${messageText}`;
+    const now = Date.now();
+    const previous = PROGRESS_DEDUPE_V1.get(key) || 0;
+
+    if (now - previous < 5 * 60 * 1000) {
+      console.log("Skipping duplicate Telegram progress message:", messageText);
+      return;
+    }
+
+    PROGRESS_DEDUPE_V1.set(key, now);
+
+    // Prevent unlimited in-memory growth.
+    if (PROGRESS_DEDUPE_V1.size > 500) {
+      for (const [k, t] of PROGRESS_DEDUPE_V1) {
+        if (now - t > 10 * 60 * 1000) {
+          PROGRESS_DEDUPE_V1.delete(k);
+        }
+      }
+    }
+  }
+
   return telegram("sendMessage", {
     chat_id: chatId,
-    text,
+    text: messageText,
     disable_web_page_preview: true,
   });
 }
