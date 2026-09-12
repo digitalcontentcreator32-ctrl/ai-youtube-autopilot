@@ -13,12 +13,25 @@ app.use(express.json({ limit: "2mb" }));
 
 /* TELEGRAM_RESUME_SINGLE_HANDLER_FINAL */
 
-app.use((req, res, next) => {
+/*
+  FINAL TELEGRAM UPDATE GATE
+
+  - Every Telegram update_id is processed only once.
+  - Duplicate webhook delivery is acknowledged but ignored.
+  - Non-resume messages continue to the normal conversational manager.
+  - Resume commands are handled exactly once.
+*/
+app.use(async (req, res, next) => {
   if (req.method !== "POST") {
     return next();
   }
 
   const update = req.body || {};
+  const updateId = Number(update?.update_id);
+
+  if (!Number.isSafeInteger(updateId)) {
+    return next();
+  }
 
   const message =
     update?.message ||
@@ -31,40 +44,100 @@ app.use((req, res, next) => {
   const text =
     String(message?.text || "").trim();
 
-  if (!chatId || !text) {
-    return next();
-  }
+  try {
+    /*
+      ATOMIC TELEGRAM UPDATE CLAIM
 
-  const match =
-    text.match(
-      /^\/resume(?:@\w+)?(?:\s+([A-Za-z0-9_-]+))?$/i
+      Same update_id can be delivered more than once by Telegram.
+      Only the first request gets the row.
+    */
+    const claimed = await db(
+      `
+      INSERT INTO telegram_updates
+        (update_id)
+      VALUES
+        ($1)
+      ON CONFLICT
+        (update_id)
+      DO NOTHING
+      RETURNING update_id
+      `,
+      [updateId]
     );
 
-  if (!match) {
-    return next();
-  }
+    if (!claimed.rows.length) {
+      console.log(
+        `Ignoring duplicate Telegram update_id=${updateId}`
+      );
 
-  const requestedJobId =
-    match[1] || null;
+      return res.sendStatus(200);
+    }
 
-  console.log(
-    `TELEGRAM_RESUME_RECEIVED chat=${chatId} job=${requestedJobId || "latest"}`
-  );
+    if (!chatId || !text) {
+      return next();
+    }
 
-  // CRITICAL:
-  // Telegram webhook receives HTTP 200 immediately.
-  // Do not wait for DB or Telegram sendMessage.
-  res.sendStatus(200);
+    const match =
+      text.match(
+        /^\/resume(?:@\w+)?(?:\s+([A-Za-z0-9_-]+))?$/i
+      );
 
-  (async () => {
-    try {
-      let jobId =
-        requestedJobId;
+    /*
+      Not a resume command:
+      let Telegram Manager V3 handle it.
+    */
+    if (!match) {
+      return next();
+    }
 
-      // Plain /resume => newest paused job.
-      if (!jobId) {
-        const result =
-          await db(
+    const requestedJobId =
+      match[1] || null;
+
+    /*
+      For plain /resume, add a short atomic cooldown.
+
+      This prevents a burst of repeated /resume updates from
+      walking through several old paused jobs.
+    */
+    if (!requestedJobId) {
+      const guard = await db(
+        `
+        INSERT INTO telegram_resume_guard
+          (chat_id, last_resume_at)
+        VALUES
+          ($1, NOW())
+        ON CONFLICT
+          (chat_id)
+        DO UPDATE SET
+          last_resume_at = NOW()
+        WHERE telegram_resume_guard.last_resume_at
+              < NOW() - INTERVAL '15 seconds'
+        RETURNING chat_id
+        `,
+        [chatId]
+      );
+
+      if (!guard.rows.length) {
+        console.log(
+          `Ignoring rapid duplicate plain /resume chat=${chatId}`
+        );
+
+        return res.sendStatus(200);
+      }
+    }
+
+    /*
+      Telegram webhook gets its HTTP 200 immediately.
+      All actual work continues in the background.
+    */
+    res.sendStatus(200);
+
+    (async () => {
+      try {
+        let jobId = requestedJobId;
+
+        if (!jobId) {
+          const result = await db(
             `
             SELECT id
             FROM jobs
@@ -76,47 +149,54 @@ app.use((req, res, next) => {
             [chatId]
           );
 
-        if (!result.rows.length) {
-          await sendMessage(
-            chatId,
-            "📭 Koi paused job nahi mili."
-          );
-          return;
+          if (!result.rows.length) {
+            await sendMessage(
+              chatId,
+              "📭 Koi paused job nahi mili."
+            ).catch(() => {});
+
+            return;
+          }
+
+          jobId = result.rows[0].id;
         }
 
-        jobId =
-          result.rows[0].id;
+        await resumeJob(
+          jobId,
+          chatId
+        );
+
+      } catch (error) {
+        console.error(
+          "FINAL TELEGRAM RESUME ERROR:",
+          error
+        );
+
+        await sendMessage(
+          chatId,
+          `⚠️ Resume process nahi ho saki.\n\n${String(error.message || error).slice(0, 500)}`
+        ).catch(() => {});
       }
+    })();
 
-      // User-visible acknowledgement happens AFTER
-      // webhook HTTP response, so Telegram cannot wait on it.
-      await sendMessage(
-        chatId,
-        `📥 Resume request received.\n\n🆔 ${jobId}`
-      );
+    return;
+  } catch (error) {
+    console.error(
+      "TELEGRAM UPDATE GATE ERROR:",
+      error
+    );
 
-      await resumeJob(
-        jobId,
-        chatId
-      );
-
-    } catch (error) {
-      console.error(
-        "TELEGRAM_RESUME_HANDLER_ERROR:",
-        error
-      );
-
-      await sendMessage(
-        chatId,
-        `⚠️ Resume process nahi ho saki.\n\n${String(error.message).slice(0, 500)}`
-      ).catch(() => {});
-    }
-  })();
-
-  return;
+    /*
+      Do not break normal Telegram processing if the
+      idempotency layer has a temporary DB problem.
+    */
+    return next();
+  }
 });
 
 /* TELEGRAM_RESUME_SINGLE_HANDLER_FINAL_END */
+
+
 
 
 
@@ -751,6 +831,25 @@ async function initDatabase() {
   /* =========================
      JOBS MIGRATION
   ========================= */
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS telegram_updates (
+      update_id BIGINT PRIMARY KEY,
+      received_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS telegram_resume_guard (
+      chat_id BIGINT PRIMARY KEY,
+      last_resume_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await db(`
+    DELETE FROM telegram_updates
+    WHERE received_at < NOW() - INTERVAL '14 days'
+  `);
 
   await db(`
     ALTER TABLE jobs
@@ -2058,6 +2157,9 @@ TTS chunk ${i + 1}/${chunks.length} failed.
 Already completed chunks are saved.
 No paid fallback was used.
 
+Technical reason:
+${String(error.message).slice(0, 800)}
+
 Resume with:
 /resume ${job.id}`
       );
@@ -2448,7 +2550,7 @@ async function processJob(
      SET status = 'running',
          updated_at = NOW()
      WHERE id = $1
-       AND status IN ('queued', 'paused')
+       AND status = 'queued'
      RETURNING id`,
     [id]
   );
@@ -2573,11 +2675,64 @@ Progress: 50%`
     "🎬 Generating video + captions\nProgress: 75%"
   );
 
-  const media =
-    await buildVideoPackage(
-      job,
-      audio
+  const existingMedia =
+    await db(
+      `
+      SELECT
+        kind,
+        data,
+        mime_type
+      FROM job_media
+      WHERE job_id = $1
+        AND kind IN (
+          'video',
+          'thumbnail',
+          'captions'
+        )
+      `,
+      [id]
     );
+
+  const mediaMap =
+    new Map(
+      existingMedia.rows.map(
+        row => [row.kind, row]
+      )
+    );
+
+  let media;
+
+  /*
+    If video outputs were already persisted before a crash,
+    NEVER render them again.
+  */
+  if (
+    mediaMap.has("video") &&
+    mediaMap.has("thumbnail") &&
+    mediaMap.has("captions")
+  ) {
+    console.log(
+      `Reusing persisted media for job ${id}`
+    );
+
+    media = {
+      video:
+        mediaMap.get("video").data,
+
+      thumbnail:
+        mediaMap.get("thumbnail").data,
+
+      captions:
+        mediaMap.get("captions").data
+    };
+
+  } else {
+    media =
+      await buildVideoPackage(
+        job,
+        audio
+      );
+  }
 
   /* =========================
      SAVE MEDIA
@@ -2829,51 +2984,70 @@ async function resumeJob(id, chatId) {
   const job = await getJob(id);
 
   if (!job) {
-    await sendMessage(
-      chatId,
-      "❌ Job not found."
-    );
-    return;
+    if (chatId) {
+      await sendMessage(
+        chatId,
+        "❌ Job not found."
+      ).catch(() => {});
+    }
+
+    return false;
   }
 
   const targetChat =
     chatId || job.chat_id;
 
-  // NEVER start another worker for a running job.
+  /*
+    NEVER restart a running job.
+  */
   if (job.status === "running") {
     await sendMessage(
       targetChat,
-      `▶️ Job already running.\n\n🆔 ${id}\n📈 Progress: ${job.progress || 0}%\n🔧 Stage: ${job.stage || "unknown"}`
-    );
-    return;
+      `ℹ️ Job already running.\n\n🆔 ${id}\n📈 Progress: ${job.progress || 0}%\n🔧 Stage: ${job.stage || "unknown"}`
+    ).catch(() => {});
+
+    return false;
   }
 
+  /*
+    NEVER restart a completed job.
+  */
   if (job.status === "completed") {
     await sendMessage(
       targetChat,
       `✅ Job already completed.\n\n🆔 ${id}`
-    );
-    return;
+    ).catch(() => {});
+
+    return false;
   }
 
+  /*
+    Queued means another worker/startup recovery already owns it.
+  */
   if (job.status === "queued") {
     await sendMessage(
       targetChat,
       `⏳ Job already queued.\n\n🆔 ${id}\n📈 Progress: ${job.progress || 0}%`
-    );
-    return;
+    ).catch(() => {});
+
+    return false;
   }
 
   if (job.status !== "paused") {
     await sendMessage(
       targetChat,
       `⚠️ Job cannot be resumed from status: ${job.status}\n\n🆔 ${id}`
-    );
-    return;
+    ).catch(() => {});
+
+    return false;
   }
 
-  // Atomic claim:
-  // only ONE paused -> queued transition can succeed.
+  /*
+    ONLY legal resume transition:
+      paused -> queued
+
+    Two simultaneous resume requests cannot both claim it.
+  */
   const claimed = await db(
     `
     UPDATE jobs
@@ -2890,30 +3064,28 @@ async function resumeJob(id, chatId) {
   );
 
   if (!claimed.rows.length) {
-    const latest = await getJob(id);
+    const latest =
+      await getJob(id);
 
-    if (latest?.status === "running") {
-      await sendMessage(
-        targetChat,
-        `▶️ Resume already started.\n\n🆔 ${id}`
-      );
-    } else {
-      await sendMessage(
-        targetChat,
-        `ℹ️ Job state changed to: ${latest?.status || "unknown"}\n\n🆔 ${id}`
-      );
-    }
+    await sendMessage(
+      targetChat,
+      latest?.status === "running"
+        ? `ℹ️ Resume already started.\n\n🆔 ${id}`
+        : `ℹ️ Job state changed to ${latest?.status || "unknown"}.\n\n🆔 ${id}`
+    ).catch(() => {});
 
-    return;
+    return false;
   }
 
   await sendMessage(
     targetChat,
     `▶️ RESUMING JOB\n\n🆔 ${id}\n\nSaved script and completed TTS chunks will be reused.`
-  );
+  ).catch(() => {});
 
-  // processJob has its own atomic queued/paused -> running claim.
-  // If anything fails, safely pause instead of crashing the worker.
+  /*
+    processJob now claims ONLY queued jobs.
+    Therefore exactly one worker can take ownership.
+  */
   processJob(
     id,
     targetChat
@@ -2927,15 +3099,17 @@ async function resumeJob(id, chatId) {
       id,
       {
         status: "paused",
-        error: error.message,
+        error: error.message
       }
     ).catch(() => {});
 
     await sendMessage(
       targetChat,
-      `⏸️ JOB PAUSED SAFELY\n\n🆔 ${id}\n⚠️ ${String(error.message).slice(0, 500)}\n\nResume: /resume ${id}`
+      `⏸️ JOB PAUSED SAFELY\n\n🆔 ${id}\n\n⚠️ ${String(error.message).slice(0, 1000)}\n\nResume: /resume ${id}`
     ).catch(() => {});
   });
+
+  return true;
 }
 
 /* =========================
