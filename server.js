@@ -11,6 +11,509 @@ const app = express();
 
 app.use(express.json({ limit: "2mb" }));
 
+
+/* TELEGRAM_MANAGER_V3_START */
+
+function parseNaturalJobRequest(text) {
+  const t = String(text || "").trim();
+
+  const patterns = [
+    /^(?:make|create|generate|banao|bana do|video banao|video bana do)\s+(?:a\s+)?(?:youtube\s+)?(?:video\s+)?(?:on|about|par|pe)\s+(.+)$/i,
+    /^(?:youtube\s+)?video\s+(?:on|about|par|pe)\s+(.+)$/i,
+    /^(.+?)\s+(?:par|pe|about|on)\s+(?:ek\s+)?video\s+(?:banao|bana do)$/i,
+    /^(?:is topic par|iss topic par|is topic pe|iss topic pe)\s+video\s+(?:banao|bana do)\s*:?\s*(.+)$/i
+  ];
+
+  for (const p of patterns) {
+    const m = t.match(p);
+
+    if (m) {
+      const topic = m[m.length - 1];
+
+      if (topic) {
+        return topic.trim().replace(/[.!?]+$/, "");
+      }
+    }
+  }
+
+  if (/^(?:make|create|generate|banao|bana do)\s+/i.test(t)) {
+    const rest = t
+      .replace(/^(?:make|create|generate|banao|bana do)\s+/i, "")
+      .trim();
+
+    if (
+      rest.length >= 4 &&
+      !/^(?:a\s+)?video\s*$/i.test(rest)
+    ) {
+      return rest
+        .replace(/^(?:a\s+)?video\s+/i, "")
+        .trim();
+    }
+  }
+
+  return null;
+}
+
+async function telegramManagerGetJobs(chatId, limit = 10) {
+  const result = await db(`
+    SELECT
+      id,
+      topic,
+      status,
+      progress,
+      stage,
+      error,
+      created_at,
+      updated_at,
+      tts_total_chunks,
+      tts_completed_chunks
+    FROM jobs
+    WHERE chat_id = $1
+    ORDER BY created_at DESC
+    LIMIT $2
+  `, [chatId, limit]);
+
+  return result.rows;
+}
+
+async function telegramManagerTargetJob(chatId, text) {
+  const jobs = await telegramManagerGetJobs(chatId, 10);
+
+  if (!jobs.length) {
+    return null;
+  }
+
+  const lower = String(text || "").toLowerCase();
+
+  const idMatch = jobs.find(job =>
+    lower.includes(String(job.id).toLowerCase())
+  );
+
+  if (idMatch) {
+    return idMatch;
+  }
+
+  const topicMatches = jobs.filter(job => {
+    const topic = String(job.topic || "").toLowerCase();
+    return topic && lower.includes(topic);
+  });
+
+  if (topicMatches.length === 1) {
+    return topicMatches[0];
+  }
+
+  return jobs[0];
+}
+
+function telegramManagerFormatJob(job) {
+  if (!job) {
+    return "📭 Koi job nahi mili.";
+  }
+
+  const progress = Number(job.progress || 0);
+
+  const tts =
+    job.tts_total_chunks
+      ? `\n🎙️ TTS: ${job.tts_completed_chunks || 0}/${job.tts_total_chunks}`
+      : "";
+
+  const error =
+    job.error
+      ? `\n⚠️ Error: ${String(job.error).slice(0, 500)}`
+      : "";
+
+  return (
+    `🎯 ${job.topic}\n` +
+    `🆔 ${job.id}\n` +
+    `📌 Status: ${job.status}\n` +
+    `📈 Progress: ${progress}%\n` +
+    `🔧 Stage: ${job.stage || "unknown"}` +
+    tts +
+    error
+  );
+}
+
+async function telegramManagerV3(chatId, text) {
+  const raw = String(text || "").trim();
+
+  if (!raw) {
+    return false;
+  }
+
+  /* =========================
+     HELP
+  ========================= */
+
+  if (
+    /\b(?:help|madad|kya kya kar sakte ho|kya kar sakte ho)\b/i
+      .test(raw)
+  ) {
+    await sendMessage(
+      chatId,
+`🤖 AI YouTube Autopilot
+
+Tum normal language me bol sakte ho:
+
+🎬 "Black hole par ek video banao"
+📊 "Mere latest jobs ka status batao"
+📈 "Ye job kitna complete hua?"
+▶️ "Isko resume karo"
+🧠 "Mere channel ka analysis karo"
+🧠 "Kya sahi hai aur kya improve karna chahiye?"
+📰 "Aaj YouTube ki latest news kya hai?"
+🕒 "Abhi kitne baje hain?"
+
+Risky actions jaise publish, delete ya payment ke liye confirmation li jayegi.`
+    );
+
+    return true;
+  }
+
+  /* =========================
+     GREETING
+  ========================= */
+
+  if (
+    /^(?:hi|hello|hey|hii|namaste|salam)\b/i.test(raw)
+  ) {
+    await sendMessage(
+      chatId,
+      "👋 Hello! Main tumhara AI YouTube Manager hoon. Jo kaam chahiye normal language me bolo."
+    );
+
+    return true;
+  }
+
+  /* =========================
+     TIME
+  ========================= */
+
+  if (
+    /\b(?:kitne baje|time kya|abhi time|current time|what time)\b/i
+      .test(raw)
+  ) {
+    const time =
+      new Intl.DateTimeFormat("en-IN", {
+        timeZone: "Asia/Kolkata",
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true
+      }).format(new Date());
+
+    await sendMessage(
+      chatId,
+      `🕒 Abhi ${time} hai.\n🌍 Asia/Kolkata`
+    );
+
+    return true;
+  }
+
+  /* =========================
+     DATE
+  ========================= */
+
+  if (
+    /\b(?:aaj ki date|today date|today|date kya hai)\b/i
+      .test(raw) &&
+    !/news|update/i.test(raw)
+  ) {
+    const date =
+      new Intl.DateTimeFormat("en-IN", {
+        timeZone: "Asia/Kolkata",
+        day: "2-digit",
+        month: "long",
+        year: "numeric"
+      }).format(new Date());
+
+    await sendMessage(
+      chatId,
+      `📅 Aaj ${date} hai.`
+    );
+
+    return true;
+  }
+
+  /* =========================
+     JOB LIST
+  ========================= */
+
+  if (
+    /\b(?:jobs?|kaam|videos?)\b/i.test(raw) &&
+    /\b(?:status|progress|running|latest|recent|dikhao|batao|kitne)\b/i
+      .test(raw)
+  ) {
+    const jobs =
+      await telegramManagerGetJobs(chatId, 5);
+
+    if (!jobs.length) {
+      await sendMessage(
+        chatId,
+        "📭 Abhi tumhare chat se koi job nahi mili."
+      );
+    } else {
+      const lines =
+        jobs.map(
+          (job, index) =>
+            `${index + 1}. ${job.topic} — ${job.status} — ${job.progress}%`
+        );
+
+      await sendMessage(
+        chatId,
+        `📊 Latest jobs:\n\n${lines.join("\n")}`
+      );
+    }
+
+    return true;
+  }
+
+  /* =========================
+     SINGLE JOB STATUS
+  ========================= */
+
+  if (
+    /\b(?:status batao|status kya hai|kitna hua|kahan tak|progress batao|latest video)\b/i
+      .test(raw)
+  ) {
+    const job =
+      await telegramManagerTargetJob(
+        chatId,
+        raw
+      );
+
+    await sendMessage(
+      chatId,
+      job
+        ? telegramManagerFormatJob(job)
+        : "📭 Is chat ke liye koi job nahi mili."
+    );
+
+    return true;
+  }
+
+  /* =========================
+     RESUME
+  ========================= */
+
+  if (
+    /\b(?:resume|chalu|continue|dobara chalao|start again)\b/i
+      .test(raw) &&
+    /\b(?:job|video|isko|isey|ise)\b/i.test(raw)
+  ) {
+    const job =
+      await telegramManagerTargetJob(
+        chatId,
+        raw
+      );
+
+    if (!job) {
+      await sendMessage(
+        chatId,
+        "📭 Resume karne ke liye koi recent job nahi mili."
+      );
+
+      return true;
+    }
+
+    if (job.status !== "paused") {
+      await sendMessage(
+        chatId,
+        `ℹ️ Ye job paused nahi hai.\n\n${telegramManagerFormatJob(job)}`
+      );
+
+      return true;
+    }
+
+    await sendMessage(
+      chatId,
+      `▶️ ${job.topic} ko resume kar raha hoon.\nSaved work reuse hoga.`
+    );
+
+    resumeJob(job.id, chatId).catch(async error => {
+      await updateJob(job.id, {
+        status: "paused",
+        error: error.message
+      }).catch(() => {});
+
+      await sendMessage(
+        chatId,
+        `⏸️ Resume ke dauran job safely pause ho gayi.\n⚠️ ${error.message.slice(0, 500)}`
+      ).catch(() => {});
+    });
+
+    return true;
+  }
+
+  /* =========================
+     NATURAL VIDEO CREATION
+  ========================= */
+
+  const topic =
+    parseNaturalJobRequest(raw);
+
+  if (topic) {
+    const id =
+      `job_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+
+    await db(
+      `
+      INSERT INTO jobs
+        (
+          id,
+          topic,
+          chat_id,
+          status,
+          progress,
+          stage
+        )
+      VALUES
+        ($1, $2, $3, 'queued', 0, 'queued')
+      `,
+      [id, topic, chatId]
+    );
+
+    await sendMessage(
+      chatId,
+`🎬 Job created
+
+Topic: ${topic}
+🆔 ${id}
+
+📝 Script
+↓
+🎙️ Narration
+↓
+🎬 Video
+↓
+📝 Captions
+↓
+🖼️ Thumbnail`
+    );
+
+    processJob(
+      id,
+      chatId
+    ).catch(async error => {
+      await updateJob(id, {
+        status: "paused",
+        error: error.message
+      }).catch(() => {});
+
+      await sendMessage(
+        chatId,
+        `⏸️ Job safely paused because of an error.
+
+🆔 ${id}
+⚠️ ${error.message.slice(0, 500)}`
+      ).catch(() => {});
+    });
+
+    return true;
+  }
+
+  /* =========================
+     AI YOUTUBE MANAGER
+  ========================= */
+
+  if (
+    /\b(?:analysis|analyze|analyse|kya sahi|kya galat|next 24|next kya|channel|youtube algorithm|algorithm|performance|perform|kaunsi video|best video|thumbnail|ctr|retention|views|improve|improvement)\b/i
+      .test(raw)
+  ) {
+    const jobs =
+      await telegramManagerGetJobs(
+        chatId,
+        10
+      );
+
+    const jobContext =
+      jobs.map(job => ({
+        id: job.id,
+        topic: job.topic,
+        status: job.status,
+        progress: job.progress,
+        stage: job.stage,
+        error: job.error,
+        created_at: job.created_at,
+        updated_at: job.updated_at
+      }));
+
+    try {
+      const result =
+        await retryGemini(
+          "gemini-3.5-flash",
+          {
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text:
+`You are the user's practical YouTube Manager.
+
+Answer in concise Hinglish.
+
+Rules:
+- Never claim secret YouTube algorithm knowledge.
+- Never invent YouTube Analytics.
+- Job status is NOT proof of video performance.
+- If YouTube Analytics is not connected, clearly say that.
+- Give useful next steps.
+- Separate facts from suggestions.
+- Never publish, delete, or spend money without explicit approval.
+
+User question:
+${raw}
+
+Available job data:
+${JSON.stringify(jobContext)}`
+                  }
+                ]
+              }
+            ],
+            generationConfig: {
+              temperature: 0.4,
+              maxOutputTokens: 700
+            }
+          },
+          30000,
+          1
+        );
+
+      const answer =
+        result?.candidates?.[0]?.content?.parts
+          ?.map(part => part.text || "")
+          .join("")
+          .trim();
+
+      if (answer) {
+        await sendMessage(
+          chatId,
+          `🧠 YouTube Manager\n\n${answer}`
+        );
+
+        return true;
+      }
+    } catch (error) {
+      console.log(
+        "Telegram Manager V3 analysis error:",
+        error.message
+      );
+
+      await sendMessage(
+        chatId,
+        "⚠️ Analysis abhi available nahi hua. Job status aur video creation phir bhi available hain."
+      );
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/* TELEGRAM_MANAGER_V3_END */
+
+
 /* TELEGRAM_FAST_INTERCEPT_V1 */
 
 /*
@@ -45,8 +548,8 @@ app.use(async (req, res, next) => {
       - simple status via PostgreSQL
       - complex questions via Gemini
     */
-    if (typeof conversationalManager === "function") {
-      const handled = await conversationalManager(
+    if (typeof telegramManagerV3 === "function") {
+      const handled = await telegramManagerV3(
         chatId,
         String(text)
       );
