@@ -11,77 +11,117 @@ const app = express();
 
 app.use(express.json({ limit: "2mb" }));
 
+/* TELEGRAM_RESUME_SINGLE_HANDLER_FINAL */
 
-/* TELEGRAM_RESUME_FINAL_V2 */
-
-app.use(async (req, res, next) => {
+app.use((req, res, next) => {
   if (req.method !== "POST") {
     return next();
   }
 
-  try {
-    const update = req.body || {};
+  const update = req.body || {};
 
-    const message =
-      update?.message ||
-      update?.edited_message ||
-      update?.channel_post;
+  const message =
+    update?.message ||
+    update?.edited_message ||
+    update?.channel_post;
 
-    const chatId = message?.chat?.id;
-    const text = String(message?.text || "").trim();
+  const chatId =
+    message?.chat?.id;
 
-    if (!chatId || !text) {
-      return next();
-    }
+  const text =
+    String(message?.text || "").trim();
 
-    const match = text.match(
-      /^\/resume(?:@\w+)?\s+([A-Za-z0-9_-]+)$/i
+  if (!chatId || !text) {
+    return next();
+  }
+
+  const match =
+    text.match(
+      /^\/resume(?:@\w+)?(?:\s+([A-Za-z0-9_-]+))?$/i
     );
 
-    if (!match) {
-      return next();
-    }
+  if (!match) {
+    return next();
+  }
 
-    const jobId = match[1];
+  const requestedJobId =
+    match[1] || null;
 
-    console.log(
-      `TELEGRAM_RESUME_FINAL_V2_RECEIVED chat=${chatId} job=${jobId}`
-    );
+  console.log(
+    `TELEGRAM_RESUME_RECEIVED chat=${chatId} job=${requestedJobId || "latest"}`
+  );
 
-    // Immediate acknowledgement.
-    await sendMessage(
-      chatId,
-      `📥 Resume request received.\n\n🆔 ${jobId}\n⏳ Checking job...`
-    );
+  // CRITICAL:
+  // Telegram webhook receives HTTP 200 immediately.
+  // Do not wait for DB or Telegram sendMessage.
+  res.sendStatus(200);
 
-    // Telegram gets HTTP 200 without waiting for the full video job.
-    res.sendStatus(200);
+  (async () => {
+    try {
+      let jobId =
+        requestedJobId;
 
-    // Continue in background.
-    resumeJob(jobId, chatId).catch(async error => {
-      console.log(
-        "TELEGRAM_RESUME_FINAL_V2_ERROR:",
-        error.message
+      // Plain /resume => newest paused job.
+      if (!jobId) {
+        const result =
+          await db(
+            `
+            SELECT id
+            FROM jobs
+            WHERE chat_id = $1
+              AND status = 'paused'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            `,
+            [chatId]
+          );
+
+        if (!result.rows.length) {
+          await sendMessage(
+            chatId,
+            "📭 Koi paused job nahi mili."
+          );
+          return;
+        }
+
+        jobId =
+          result.rows[0].id;
+      }
+
+      // User-visible acknowledgement happens AFTER
+      // webhook HTTP response, so Telegram cannot wait on it.
+      await sendMessage(
+        chatId,
+        `📥 Resume request received.\n\n🆔 ${jobId}`
+      );
+
+      await resumeJob(
+        jobId,
+        chatId
+      );
+
+    } catch (error) {
+      console.error(
+        "TELEGRAM_RESUME_HANDLER_ERROR:",
+        error
       );
 
       await sendMessage(
         chatId,
-        `⚠️ Resume failed.\n\n🆔 ${jobId}\n${String(error.message).slice(0, 500)}`
+        `⚠️ Resume process nahi ho saki.\n\n${String(error.message).slice(0, 500)}`
       ).catch(() => {});
-    });
+    }
+  })();
 
-    return;
-  } catch (error) {
-    console.log(
-      "TELEGRAM_RESUME_FINAL_V2_HANDLER_ERROR:",
-      error.message
-    );
-
-    return next();
-  }
+  return;
 });
 
-/* TELEGRAM_RESUME_FINAL_V2 */
+/* TELEGRAM_RESUME_SINGLE_HANDLER_FINAL_END */
+
+
+
+
+
 
 
 
@@ -2501,8 +2541,6 @@ Progress: 50%`
   // Refresh after status updates so resume/restart always uses the
   // latest persisted script and chat_id.
   job = await getJob(id);
-  job =
-    await getJob(id);
 
   await sendMessage(
     targetChat,
@@ -2787,56 +2825,104 @@ Resume with:
    RESUME
 ========================= */
 
-async function resumeJob(
-  id,
-  chatId
-) {
-  const job =
-    await getJob(id);
+async function resumeJob(id, chatId) {
+  const job = await getJob(id);
 
   if (!job) {
     await sendMessage(
       chatId,
       "❌ Job not found."
     );
+    return;
+  }
 
+  const targetChat =
+    chatId || job.chat_id;
+
+  // NEVER start another worker for a running job.
+  if (job.status === "running") {
+    await sendMessage(
+      targetChat,
+      `▶️ Job already running.\n\n🆔 ${id}\n📈 Progress: ${job.progress || 0}%\n🔧 Stage: ${job.stage || "unknown"}`
+    );
     return;
   }
 
   if (job.status === "completed") {
     await sendMessage(
-      chatId,
-      "✅ This job is already completed."
+      targetChat,
+      `✅ Job already completed.\n\n🆔 ${id}`
     );
+    return;
+  }
+
+  if (job.status === "queued") {
+    await sendMessage(
+      targetChat,
+      `⏳ Job already queued.\n\n🆔 ${id}\n📈 Progress: ${job.progress || 0}%`
+    );
+    return;
+  }
+
+  if (job.status !== "paused") {
+    await sendMessage(
+      targetChat,
+      `⚠️ Job cannot be resumed from status: ${job.status}\n\n🆔 ${id}`
+    );
+    return;
+  }
+
+  // Atomic claim:
+  // only ONE paused -> queued transition can succeed.
+  const claimed = await db(
+    `
+    UPDATE jobs
+    SET
+      status = 'queued',
+      chat_id = $2,
+      error = NULL,
+      updated_at = NOW()
+    WHERE id = $1
+      AND status = 'paused'
+    RETURNING id
+    `,
+    [id, targetChat]
+  );
+
+  if (!claimed.rows.length) {
+    const latest = await getJob(id);
+
+    if (latest?.status === "running") {
+      await sendMessage(
+        targetChat,
+        `▶️ Resume already started.\n\n🆔 ${id}`
+      );
+    } else {
+      await sendMessage(
+        targetChat,
+        `ℹ️ Job state changed to: ${latest?.status || "unknown"}\n\n🆔 ${id}`
+      );
+    }
 
     return;
   }
 
-  const savedChat =
-    chatId || job.chat_id;
-
-  await updateJob(
-    id,
-    {
-      chat_id: savedChat,
-      status: "queued",
-      error: null,
-    }
-  );
-
   await sendMessage(
-    savedChat,
-    `▶️ RESUMING JOB
-
-${id}
-
-Saved script and completed TTS chunks will be reused.`
+    targetChat,
+    `▶️ RESUMING JOB\n\n🆔 ${id}\n\nSaved script and completed TTS chunks will be reused.`
   );
 
+  // processJob has its own atomic queued/paused -> running claim.
+  // If anything fails, safely pause instead of crashing the worker.
   processJob(
     id,
-    savedChat
-  ).catch(async (error) => {
+    targetChat
+  ).catch(async error => {
+    console.error(
+      `Resume worker failed for ${id}:`,
+      error
+    );
+
     await updateJob(
       id,
       {
@@ -2846,13 +2932,8 @@ Saved script and completed TTS chunks will be reused.`
     ).catch(() => {});
 
     await sendMessage(
-      savedChat,
-      `⏸️ JOB PAUSED SAFELY
-
-Reason: ${error.message}
-
-Resume with:
-/resume ${id}`
+      targetChat,
+      `⏸️ JOB PAUSED SAFELY\n\n🆔 ${id}\n⚠️ ${String(error.message).slice(0, 500)}\n\nResume: /resume ${id}`
     ).catch(() => {});
   });
 }
