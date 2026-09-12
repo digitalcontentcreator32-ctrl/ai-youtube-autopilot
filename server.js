@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import ffmpegPath from "ffmpeg-static";
 
 const { Pool } = pg;
 const app = express();
@@ -198,8 +199,6 @@ async function initDatabase() {
   `);
 
   /* =========================
-<<<<<<< HEAD
-=======
      LEGACY AUDIO COLUMN FIX
   ========================= */
 
@@ -236,7 +235,6 @@ async function initDatabase() {
   `);
 
   /* =========================
->>>>>>> ff8370b (Add video generation captions and thumbnail pipeline)
      DEFAULT VALUES
   ========================= */
 
@@ -1751,14 +1749,11 @@ Progress: 50%`
     error: null,
   });
 
-<<<<<<< HEAD
   // Refresh after status updates so resume/restart always uses the
   // latest persisted script and chat_id.
   job = await getJob(id);
-=======
   job =
     await getJob(id);
->>>>>>> ff8370b (Add video generation captions and thumbnail pipeline)
 
   await sendMessage(
     targetChat,
