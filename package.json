@@ -1,6 +1,10 @@
 {
   "name": "ai-youtube-autopilot-backend",
+<<<<<<< HEAD
   "version": "1.0.1",
+=======
+  "version": "1.1.0",
+>>>>>>> ff8370b (Add video generation captions and thumbnail pipeline)
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +13,7 @@
   },
   "dependencies": {
     "express": "^5.1.0",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "ffmpeg-static": "^5.2.0"
   }
 }

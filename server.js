@@ -198,6 +198,45 @@ async function initDatabase() {
   `);
 
   /* =========================
+<<<<<<< HEAD
+=======
+     LEGACY AUDIO COLUMN FIX
+  ========================= */
+
+  await db(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'job_audio_chunks'
+          AND column_name = 'audio'
+      ) THEN
+        ALTER TABLE job_audio_chunks
+        ALTER COLUMN audio DROP NOT NULL;
+      END IF;
+    END $$;
+  `);
+
+  /* =========================
+     VIDEO MEDIA
+  ========================= */
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS job_media (
+      job_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      data BYTEA NOT NULL,
+      mime_type TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (job_id, kind)
+    )
+  `);
+
+  /* =========================
+>>>>>>> ff8370b (Add video generation captions and thumbnail pipeline)
      DEFAULT VALUES
   ========================= */
 
@@ -1291,45 +1330,337 @@ Resume with:
     );
 
   await updateJob(job.id, {
-    status: "completed",
+    status: "running",
     stage: "tts_complete",
-    progress: 100,
+    progress: 70,
     tts_completed_chunks:
       chunks.length,
     error: null,
   });
 
-  const targetChat =
-    chatId || job.chat_id;
+  return audio;
+}
 
-  await sendMessage(
-    targetChat,
-    `✅ TTS COMPLETED
+/* =========================
+   VIDEO GENERATION
+========================= */
 
-${chunks.length} narration chunks generated.
-Audio file is being sent now.`
+async function runFFmpeg(args, timeoutMs = 300000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stderr = "";
+
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`FFMPEG_TIMEOUT_${timeoutMs}MS`));
+    }, timeoutMs);
+
+    child.stderr.on("data", d => {
+      stderr += d.toString();
+    });
+
+    child.on("error", err => {
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    child.on("close", code => {
+      clearTimeout(timer);
+
+      if (code === 0) {
+        resolve({ stderr });
+      } else {
+        reject(
+          new Error(
+            `FFmpeg failed with code ${code}: ${stderr.slice(-3000)}`
+          )
+        );
+      }
+    });
+  });
+}
+
+function wavDurationSeconds(wav) {
+  const format = getWavFormat(wav);
+  const pcm = getWavPcm(wav);
+
+  if (!format.sampleRate || !format.channels || !format.bits) {
+    return 1;
+  }
+
+  const bytesPerSecond =
+    format.sampleRate *
+    format.channels *
+    (format.bits / 8);
+
+  if (!bytesPerSecond) return 1;
+
+  return Math.max(
+    1,
+    pcm.length / bytesPerSecond
   );
+}
 
-  if (
-    audio.length <=
-    49 * 1024 * 1024
-  ) {
-    await sendDocument(
-      targetChat,
-      audio,
-      `${job.id}.wav`,
-      "audio/wav",
-      `🎙️ AI narration completed
-Job: ${job.id}`
-    );
-  } else {
-    await sendMessage(
-      targetChat,
-      "⚠️ Narration completed, but the WAV file is above Telegram's upload limit."
+function createSrt(script, duration) {
+  const words = String(script || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (!words.length) return "";
+
+  const groups = [];
+
+  for (let i = 0; i < words.length; i += 10) {
+    groups.push(
+      words.slice(i, i + 10).join(" ")
     );
   }
 
-  return true;
+  const step =
+    duration / groups.length;
+
+  function stamp(seconds) {
+    const totalMs =
+      Math.max(0, Math.floor(seconds * 1000));
+
+    const h =
+      Math.floor(totalMs / 3600000);
+
+    const m =
+      Math.floor(
+        (totalMs % 3600000) / 60000
+      );
+
+    const sec =
+      Math.floor(
+        (totalMs % 60000) / 1000
+      );
+
+    const ms =
+      totalMs % 1000;
+
+    return (
+      String(h).padStart(2, "0") +
+      ":" +
+      String(m).padStart(2, "0") +
+      ":" +
+      String(sec).padStart(2, "0") +
+      "," +
+      String(ms).padStart(3, "0")
+    );
+  }
+
+  return groups.map((text, i) => {
+    const start = i * step;
+    const end =
+      Math.min(
+        duration,
+        (i + 1) * step
+      );
+
+    return (
+      `${i + 1}\n` +
+      `${stamp(start)} --> ${stamp(end)}\n` +
+      `${text}\n`
+    );
+  }).join("\n");
+}
+
+function ffmpegFilterPath(path) {
+  return String(path)
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\'");
+}
+
+async function buildVideoPackage(job, audioBuffer) {
+  const workDir = await mkdtemp(
+    join(
+      tmpdir(),
+      `autopilot-video-${job.id}-`
+    )
+  );
+
+  const audioFile =
+    join(workDir, "narration.wav");
+
+  const srtFile =
+    join(workDir, "captions.srt");
+
+  const videoFile =
+    join(workDir, "video.mp4");
+
+  const thumbFile =
+    join(workDir, "thumbnail.jpg");
+
+  const titleFile =
+    join(workDir, "title.txt");
+
+  try {
+    const { writeFile } =
+      await import("node:fs/promises");
+
+    await writeFile(
+      audioFile,
+      audioBuffer
+    );
+
+    const duration =
+      wavDurationSeconds(audioBuffer);
+
+    const srt =
+      createSrt(
+        job.script,
+        duration
+      );
+
+    await writeFile(
+      srtFile,
+      srt,
+      "utf8"
+    );
+
+    await writeFile(
+      titleFile,
+      String(
+        job.topic ||
+        "Amazing Facts"
+      ).slice(0, 100),
+      "utf8"
+    );
+
+    const subtitlePath =
+      ffmpegFilterPath(srtFile);
+
+    await runFFmpeg([
+      "-y",
+
+      "-f",
+      "lavfi",
+
+      "-i",
+      "color=c=0x101820:s=1280x720:r=30",
+
+      "-i",
+      audioFile,
+
+      "-vf",
+      `subtitles='${subtitlePath}':force_style='FontName=DejaVu Sans,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=55'`,
+
+      "-c:v",
+      "libx264",
+
+      "-preset",
+      "veryfast",
+
+      "-pix_fmt",
+      "yuv420p",
+
+      "-c:a",
+      "aac",
+
+      "-b:a",
+      "128k",
+
+      "-shortest",
+
+      videoFile
+    ]);
+
+    await runFFmpeg([
+      "-y",
+
+      "-f",
+      "lavfi",
+
+      "-i",
+      "color=c=0x101820:s=1280x720",
+
+      "-frames:v",
+      "1",
+
+      "-vf",
+      `drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:textfile='${ffmpegFilterPath(titleFile)}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.45:boxborderw=24`,
+
+      thumbFile
+    ]);
+
+    return {
+      video:
+        await readFile(videoFile),
+
+      thumbnail:
+        await readFile(thumbFile),
+
+      captions:
+        Buffer.from(srt, "utf8")
+    };
+
+  } finally {
+    await rm(
+      workDir,
+      {
+        recursive: true,
+        force: true
+      }
+    ).catch(() => {});
+  }
+}
+
+async function sendVideo(
+  chatId,
+  buffer,
+  filename,
+  caption = ""
+) {
+  if (!chatId) return;
+
+  const form = new FormData();
+
+  form.append(
+    "chat_id",
+    String(chatId)
+  );
+
+  form.append(
+    "video",
+    new Blob(
+      [buffer],
+      { type: "video/mp4" }
+    ),
+    filename
+  );
+
+  if (caption) {
+    form.append(
+      "caption",
+      caption
+    );
+  }
+
+  const response =
+    await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo`,
+      {
+        method: "POST",
+        body: form
+      }
+    );
+
+  const data =
+    await response.json();
+
+  if (!data.ok) {
+    throw new Error(
+      `Telegram video error: ${JSON.stringify(data)}`
+    );
+  }
+
+  return data.result;
 }
 
 /* =========================
@@ -1359,6 +1690,10 @@ async function processJob(
   });
 
   job = await getJob(id);
+
+  /* =========================
+     SCRIPT
+  ========================= */
 
   if (!job.script) {
     await updateJob(id, {
@@ -1401,8 +1736,13 @@ Progress: 40%
 Progress: 50%`
     );
 
-    job = await getJob(id);
+    job =
+      await getJob(id);
   }
+
+  /* =========================
+     TTS
+  ========================= */
 
   await updateJob(id, {
     stage: "tts",
@@ -1411,20 +1751,212 @@ Progress: 50%`
     error: null,
   });
 
+<<<<<<< HEAD
   // Refresh after status updates so resume/restart always uses the
   // latest persisted script and chat_id.
   job = await getJob(id);
+=======
+  job =
+    await getJob(id);
+>>>>>>> ff8370b (Add video generation captions and thumbnail pipeline)
 
   await sendMessage(
     targetChat,
     "🎙️ Generating AI narration\nProgress: 55%"
   );
 
-  await processTTS(
-    job,
-    targetChat
+  const audio =
+    await processTTS(
+      job,
+      targetChat
+    );
+
+  if (!audio) {
+    return;
+  }
+
+  /* =========================
+     VIDEO
+  ========================= */
+
+  await updateJob(id, {
+    stage: "video",
+    progress: 75,
+    status: "running",
+    error: null,
+  });
+
+  await sendMessage(
+    targetChat,
+    "🎬 Generating video + captions\nProgress: 75%"
   );
-    }
+
+  const media =
+    await buildVideoPackage(
+      job,
+      audio
+    );
+
+  /* =========================
+     SAVE MEDIA
+  ========================= */
+
+  await db(
+    `
+    INSERT INTO job_media
+      (
+        job_id,
+        kind,
+        data,
+        mime_type
+      )
+    VALUES
+      (
+        $1,
+        'video',
+        $2,
+        'video/mp4'
+      )
+    ON CONFLICT
+      (job_id, kind)
+    DO UPDATE SET
+      data = EXCLUDED.data,
+      mime_type = EXCLUDED.mime_type,
+      updated_at = NOW()
+    `,
+    [
+      id,
+      media.video
+    ]
+  );
+
+  await db(
+    `
+    INSERT INTO job_media
+      (
+        job_id,
+        kind,
+        data,
+        mime_type
+      )
+    VALUES
+      (
+        $1,
+        'thumbnail',
+        $2,
+        'image/jpeg'
+      )
+    ON CONFLICT
+      (job_id, kind)
+    DO UPDATE SET
+      data = EXCLUDED.data,
+      mime_type = EXCLUDED.mime_type,
+      updated_at = NOW()
+    `,
+    [
+      id,
+      media.thumbnail
+    ]
+  );
+
+  await db(
+    `
+    INSERT INTO job_media
+      (
+        job_id,
+        kind,
+        data,
+        mime_type
+      )
+    VALUES
+      (
+        $1,
+        'captions',
+        $2,
+        'application/x-subrip'
+      )
+    ON CONFLICT
+      (job_id, kind)
+    DO UPDATE SET
+      data = EXCLUDED.data,
+      mime_type = EXCLUDED.mime_type,
+      updated_at = NOW()
+    `,
+    [
+      id,
+      media.captions
+    ]
+  );
+
+  await updateJob(id, {
+    stage: "video_complete",
+    progress: 90,
+    status: "running",
+    error: null,
+  });
+
+  /* =========================
+     TELEGRAM OUTPUT
+  ========================= */
+
+  if (
+    media.video.length <=
+    49 * 1024 * 1024
+  ) {
+    await sendVideo(
+      targetChat,
+      media.video,
+      `${id}.mp4`,
+      "🎬 Video generated with captions"
+    );
+  } else {
+    await sendDocument(
+      targetChat,
+      media.video,
+      `${id}.mp4`,
+      "video/mp4",
+      "🎬 Video generated"
+    );
+  }
+
+  await sendDocument(
+    targetChat,
+    media.thumbnail,
+    `${id}-thumbnail.jpg`,
+    "image/jpeg",
+    "🖼️ Thumbnail generated"
+  );
+
+  await sendDocument(
+    targetChat,
+    media.captions,
+    `${id}.srt`,
+    "application/x-subrip",
+    "📝 Captions generated"
+  );
+
+  await updateJob(id, {
+    stage: "completed",
+    progress: 100,
+    status: "completed",
+    error: null,
+  });
+
+  await sendMessage(
+    targetChat,
+    `✅ VIDEO PIPELINE COMPLETED
+
+Job: ${id}
+
+🎙️ Narration: READY
+🎬 Video: READY
+📝 Captions: READY
+🖼️ Thumbnail: READY
+
+Next stage: YouTube upload.`
+  );
+}
+
 /* =========================
    CREATE
 ========================= */
