@@ -521,67 +521,106 @@ async function retryGemini(
 ========================= */
 
 async function generateScript(topic) {
-  const prompt = `
-Create an original YouTube narration script about:
+  const basePrompt = `
+Create a complete ORIGINAL YouTube narration script about:
 
 ${topic}
 
-Requirements:
+This is for a long-form faceless YouTube video.
+
+MANDATORY REQUIREMENTS:
+- Write 600 to 900 words.
+- Do NOT write a short answer.
+- Do NOT summarize.
+- Do NOT explain what you are going to write.
+- Output ONLY the finished narration.
+- Strong opening hook in the first paragraph.
+- Clear, interesting explanations.
+- Natural spoken narration.
+- Add useful detail, examples, comparisons or context where appropriate.
 - Completely original wording.
-- Strong opening hook.
-- Clear factual explanations.
 - No copied article wording.
 - No fake citations.
-- Suitable for a faceless YouTube video.
-- Around 600-800 words.
-- Natural spoken narration.
 - No stage directions.
+- No headings such as "Introduction", "Conclusion", or "Scene".
+- The final response must be suitable to read aloud directly.
+
+IMPORTANT:
+If your first draft is too short, rewrite it before returning the answer.
+Target approximately 750 words.
 `;
 
   let lastError;
 
   for (const model of SCRIPT_MODELS) {
-    try {
-      const result = await retryGemini(
-        model,
-        {
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: prompt }],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.8,
-            maxOutputTokens: 3000,
-          },
-        },
-        45000,
-        2
-      );
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const prompt =
+          attempt === 1
+            ? basePrompt
+            : `${basePrompt}
 
-      const text = result?.candidates?.[0]?.content?.parts
-        ?.map((part) => part.text || "")
-        .join("")
-        .trim();
+RETRY INSTRUCTION:
+Your previous generation was too short.
+Generate a NEW complete script now.
+It MUST contain at least 500 words and should be around 750 words.
+Do not mention this retry instruction.`;
 
-      if (text) {
-        return {
-          script: text,
+        const result = await retryGemini(
           model,
-        };
-      }
-    } catch (error) {
-      console.log(
-        `Script model failed: ${model}: ${error.message}`
-      );
+          {
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: prompt }],
+              },
+            ],
+            generationConfig: {
+              temperature: 0.8,
+              maxOutputTokens: 4000,
+            },
+          },
+          60000,
+          2
+        );
 
-      lastError = error;
+        const text = result?.candidates?.[0]?.content?.parts
+          ?.map((part) => part.text || "")
+          .join("")
+          .trim();
+
+        const wordCount = text
+          ? text.split(/\s+/).filter(Boolean).length
+          : 0;
+
+        console.log(
+          `Script attempt: model=${model}, attempt=${attempt}, words=${wordCount}`
+        );
+
+        if (text && wordCount >= 450) {
+          return {
+            script: text,
+            model,
+          };
+        }
+
+        console.log(
+          `Script too short (${wordCount} words). Regenerating...`
+        );
+      } catch (error) {
+        console.log(
+          `Script model failed: ${model}, attempt=${attempt}: ${error.message}`
+        );
+
+        lastError = error;
+      }
     }
   }
 
   throw lastError ||
-    new Error("All script models failed");
+    new Error(
+      "Unable to generate a sufficiently long script after automatic regeneration"
+    );
 }
 
 /* =========================
@@ -594,9 +633,9 @@ function qualityCheck(script) {
     .split(/\s+/)
     .filter(Boolean);
 
-  if (words.length < 150) {
+  if (words.length < 450) {
     throw new Error(
-      "Script too short for quality gate"
+      `Script too short for quality gate: ${words.length} words (minimum 450)`
     );
   }
 
