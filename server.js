@@ -1,7 +1,7 @@
 import express from "express";
 import pg from "pg";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import ffmpegPath from "ffmpeg-static";
@@ -1391,58 +1391,73 @@ async function generateTTSChunk(text, model) {
 }
 
 async function generateLocalPiperTTS(text) {
-  const workDir = await mkdtemp(join(tmpdir(), "autopilot-piper-"));
-  const outputFile = join(workDir, "speech.wav");
-  const model = process.env.PIPER_MODEL || "en_US-lessac-medium";
-  const python = process.env.PIPER_PYTHON || "python3";
+  const workDir = await mkdtemp(join(tmpdir(), "piper-job-"));
+  const dataDir = process.env.PIPER_DATA_DIR || join(process.cwd(), ".piper-voices");
+
+  await mkdir(dataDir, { recursive: true });
+
+  const outputPath = join(workDir, "speech.wav");
 
   try {
-    console.log(`TTS fallback: local Piper model=${model}`);
-
     await new Promise((resolve, reject) => {
       const child = spawn(
-        python,
+        "python3",
         [
           "-m",
           "piper",
           "--model",
-          model,
+          "en_US-lessac-medium",
           "--data-dir",
-          workDir,
+          dataDir,
+          "--download-dir",
+          dataDir,
           "--output_file",
-          outputFile,
+          outputPath
         ],
-        { stdio: ["pipe", "pipe", "pipe"] }
+        {
+          stdio: ["pipe", "pipe", "pipe"]
+        }
       );
 
       let stderr = "";
-      child.stderr.on("data", (chunk) => {
+
+      child.stderr.on("data", chunk => {
         stderr += chunk.toString();
       });
 
       child.on("error", reject);
-      child.on("close", (code) => {
-        if (code === 0) return resolve();
-        reject(new Error(`Piper exited with code ${code}: ${stderr.slice(-2000)}`));
+
+      child.on("close", code => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(
+            new Error(
+              `Piper exited with code ${code}: ${stderr.slice(0, 1000)}`
+            )
+          );
+        }
       });
 
-      child.stdin.end(text);
+      child.stdin.write(String(text || ""));
+      child.stdin.end();
     });
 
-    const buffer = await readFile(outputFile);
+    const audio = await readFile(outputPath);
 
-    if (!isWav(buffer)) {
-      throw new Error("Piper returned invalid WAV audio");
+    if (!audio.length) {
+      throw new Error("Piper returned an empty WAV file.");
     }
 
     return {
-      buffer,
-      mimeType: "audio/wav",
-      sampleRate: 22050,
-      model: `piper:${model}`,
+      buffer: audio,
+      mimeType: "audio/wav"
     };
   } finally {
-    await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    await rm(workDir, {
+      recursive: true,
+      force: true
+    }).catch(() => {});
   }
 }
 
