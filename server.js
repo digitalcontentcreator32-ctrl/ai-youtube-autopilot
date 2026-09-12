@@ -1709,24 +1709,25 @@ async function processJob(
   chatId = null
 ) {
   /* =========================
-     DUPLICATE JOB LOCK
+     DUPLICATE JOB PROTECTION
   ========================= */
 
-  // PostgreSQL advisory lock guarantees that the same job
-  // can only be processed by one worker at a time.
-  const lockResult = await db(
-    `SELECT pg_try_advisory_lock(
-       hashtextextended($1, 0)
-     ) AS locked`,
+  // Atomically claim queued/paused jobs.
+  // This is safe with PostgreSQL connection pooling.
+  const claim = await db(
+    `UPDATE jobs
+     SET status = 'running',
+         updated_at = NOW()
+     WHERE id = $1
+       AND status IN ('queued', 'paused')
+     RETURNING id`,
     [id]
   );
 
-  if (!lockResult.rows[0]?.locked) {
-    console.log(`Job ${id} is already being processed; duplicate worker skipped.`);
+  if (!claim.rows.length) {
+    console.log(`Job ${id} is already running or completed; duplicate worker skipped.`);
     return false;
   }
-
-  try {
 
   let job =
     await getJob(id);
@@ -2009,22 +2010,8 @@ Job: ${id}
 
 Next stage: YouTube upload.`
   );
-  } finally {
-    // Always release the lock, including failures and early returns.
-    await db(
-      `SELECT pg_advisory_unlock(
-         hashtextextended($1, 0)
-       )`,
-      [id]
-    ).catch((unlockError) => {
-      console.error(
-        `Failed to release job lock for ${id}:`,
-        unlockError
-      );
-    });
-  }
-
 }
+
 
 /* =========================
    CREATE
