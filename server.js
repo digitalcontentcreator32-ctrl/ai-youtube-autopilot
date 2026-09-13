@@ -1676,14 +1676,18 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
     voice
   );
 
-  await new Promise((resolve, reject) => {
+  let lastError;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await new Promise((resolve, reject) => {
     const child = spawn(
       "python3",
       [
         "-m",
         "piper",
         "--model",
-        voice,
+        join(dataDir, `${voice}.onnx`),
         "--data-dir",
         dataDir,
         "--download-dir",
@@ -1720,26 +1724,44 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
       String(text || "")
     );
 
-    child.stdin.end();
-  });
+      child.stdin.end();
+      });
 
-  const audio =
-    await readFile(outputPath);
+      const audio =
+        await readFile(outputPath);
 
-  if (
-    !audio.length ||
-    !isWav(audio)
-  ) {
-    throw new Error(
-      `Piper ${voice} produced invalid/empty WAV`
-    );
+      if (
+        !audio.length ||
+        !isWav(audio)
+      ) {
+        throw new Error(
+          `Piper ${voice} produced invalid/empty WAV`
+        );
+      }
+
+      return {
+        buffer: audio,
+        mimeType: "audio/wav",
+        model: `piper-${voice}`
+      };
+
+    } catch (error) {
+      lastError = error;
+
+      console.error(
+        `Piper ${voice} attempt ${attempt} failed:`,
+        error.message
+      );
+
+      if (attempt < 2) {
+        await sleep(2000);
+      }
+    }
   }
 
-  return {
-    buffer: audio,
-    mimeType: "audio/wav",
-    model: `piper-${voice}`
-  };
+  throw lastError || new Error(
+    `Piper ${voice} failed`
+  );
 }
 
 async function generateLocalPiperTTS(text) {
@@ -1769,7 +1791,10 @@ async function generateLocalPiperTTS(text) {
       "speech.wav"
     );
 
-  const voices = ["en_US-lessac-low"];
+  const voices = [
+    "en_US-lessac-medium",
+    "en_US-lessac-low"
+  ];
 
   let lastError;
 
