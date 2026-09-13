@@ -1670,20 +1670,129 @@ async function ensurePiperVoice(dataDir, voice) {
   await readFile(configPath);
 }
 
+/* PIPER_FINAL_HARDENING_V2 */
+
+/*
+  Final Piper runtime hardening.
+
+  Piper requires its phonemization data at runtime. The Python package
+  bundles espeak-ng-data, but the runtime environment may not expose it
+  automatically. Detect it from the installed package and pass it explicitly.
+*/
+async function findPiperEspeakDataDir(dataDir) {
+  const candidates = [
+    process.env.ESPEAK_DATA_PATH,
+    join(dataDir, "espeak-ng-data"),
+    join(process.cwd(), "espeak-ng-data"),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      const stat = await import("node:fs/promises").then(m => m.stat(candidate));
+      if (stat.isDirectory()) {
+        return candidate;
+      }
+    } catch {}
+  }
+
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(
+        "python3",
+        [
+          "-c",
+          "import pathlib,piper_phonemize; print(pathlib.Path(piper_phonemize.__file__).resolve().parent / 'espeak-ng-data')"
+        ],
+        {
+          stdio: ["ignore", "pipe", "pipe"]
+        }
+      );
+
+      let stdout = "";
+      let stderr = "";
+
+      child.stdout.on("data", d => {
+        stdout += d.toString();
+      });
+
+      child.stderr.on("data", d => {
+        stderr += d.toString();
+      });
+
+      child.on("error", reject);
+
+      child.on("close", code => {
+        if (code === 0) {
+          resolve(stdout.trim());
+        } else {
+          reject(
+            new Error(
+              `Piper espeak data probe failed: ${stderr.slice(-1000)}`
+            )
+          );
+        }
+      });
+    });
+
+    const discovered = String(result || "").trim();
+
+    if (discovered) {
+      try {
+        const stat = await import("node:fs/promises").then(m => m.stat(discovered));
+        if (stat.isDirectory()) {
+          return discovered;
+        }
+      } catch {}
+    }
+  } catch (error) {
+    console.log(
+      "Piper espeak data auto-detection failed:",
+      error.message
+    );
+  }
+
+  return null;
+}
+
 async function runPiperVoice(text, voice, dataDir, outputPath) {
-  await ensurePiperVoice(
-    dataDir,
-    voice
-  );
+  const espeakDataDir =
+    await findPiperEspeakDataDir(dataDir);
+
+  const runtimeEnv = {
+    ...process.env,
+    ...(espeakDataDir
+      ? {
+          ESPEAK_DATA_PATH: espeakDataDir
+        }
+      : {})
+  };
 
   let lastError;
 
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      await new Promise((resolve, reject) => {
-    const child = spawn(
-      "python3",
-      [
+  /*
+    Try the installed Piper executable first.
+    The piper-tts package officially exposes the `piper`
+    console command.
+  */
+  const runners = [
+    {
+      command: "piper",
+      args: [
+        "--model",
+        join(dataDir, `${voice}.onnx`),
+        "--data-dir",
+        dataDir,
+        "--download-dir",
+        dataDir,
+        "--output_file",
+        outputPath,
+        "--sentence-silence",
+        "0.05"
+      ]
+    },
+    {
+      command: "python3",
+      args: [
         "-m",
         "piper",
         "--model",
@@ -1693,75 +1802,99 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
         "--download-dir",
         dataDir,
         "--output_file",
-        outputPath
-      ],
-      {
-        stdio: ["pipe", "pipe", "pipe"]
-      }
-    );
+        outputPath,
+        "--sentence-silence",
+        "0.05"
+      ]
+    }
+  ];
 
-    let stderr = "";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    for (const runner of runners) {
+      try {
+        console.log(
+          `Piper attempt=${attempt} runner=${runner.command} voice=${voice} espeak=${espeakDataDir || "auto/default"}`
+        );
 
-    child.stderr.on("data", chunk => {
-      stderr += chunk.toString();
-    });
+        await new Promise((resolve, reject) => {
+          const child = spawn(
+            runner.command,
+            runner.args,
+            {
+              env: runtimeEnv,
+              stdio: ["pipe", "pipe", "pipe"]
+            }
+          );
 
-    child.on("error", reject);
+          let stderr = "";
+          let stdout = "";
 
-    child.on("close", code => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(
-          new Error(
-            `Piper ${voice} failed, exit=${code}: ${stderr.slice(-2000)}`
-          )
+          child.stdout.on("data", chunk => {
+            stdout += chunk.toString();
+          });
+
+          child.stderr.on("data", chunk => {
+            stderr += chunk.toString();
+          });
+
+          child.on("error", reject);
+
+          child.on("close", code => {
+            if (code === 0) {
+              resolve();
+            } else {
+              reject(
+                new Error(
+                  `Piper runner=${runner.command} voice=${voice} exit=${code}: ${stderr.slice(-3000) || stdout.slice(-1000)}`
+                )
+              );
+            }
+          });
+
+          child.stdin.write(
+            String(text || "")
+          );
+
+          child.stdin.end();
+        });
+
+        const audio =
+          await readFile(outputPath);
+
+        if (
+          !audio.length ||
+          !isWav(audio)
+        ) {
+          throw new Error(
+            `Piper ${voice} produced invalid/empty WAV`
+          );
+        }
+
+        return {
+          buffer: audio,
+          mimeType: "audio/wav",
+          model: `piper-${voice}`
+        };
+
+      } catch (error) {
+        lastError = error;
+
+        console.error(
+          `Piper runner failed: ${runner.command}, voice=${voice}:`,
+          error.message
         );
       }
-    });
+    }
 
-    child.stdin.write(
-      String(text || "")
-    );
-
-      child.stdin.end();
-      });
-
-      const audio =
-        await readFile(outputPath);
-
-      if (
-        !audio.length ||
-        !isWav(audio)
-      ) {
-        throw new Error(
-          `Piper ${voice} produced invalid/empty WAV`
-        );
-      }
-
-      return {
-        buffer: audio,
-        mimeType: "audio/wav",
-        model: `piper-${voice}`
-      };
-
-    } catch (error) {
-      lastError = error;
-
-      console.error(
-        `Piper ${voice} attempt ${attempt} failed:`,
-        error.message
-      );
-
-      if (attempt < 2) {
-        await sleep(2000);
-      }
+    if (attempt < 2) {
+      await sleep(2000);
     }
   }
 
-  throw lastError || new Error(
-    `Piper ${voice} failed`
-  );
+  throw lastError ||
+    new Error(
+      `Piper ${voice} failed`
+    );
 }
 
 async function generateLocalPiperTTS(text) {
@@ -1957,7 +2090,7 @@ async function generateTTSWithRetry(text) {
 
   const finalError =
     new Error(
-      `All TTS providers unavailable. Local Piper and Gemini failed. Piper: ${localPiperError?.message || "not available"} | Gemini: ${lastGeminiError?.message || "not available"}`
+      `All TTS providers unavailable. Piper: ${localPiperError?.message || "not available"} | Gemini: ${lastGeminiError?.message || "not available"}`
     );
 
   finalError.code =
