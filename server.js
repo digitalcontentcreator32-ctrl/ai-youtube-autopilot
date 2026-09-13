@@ -1682,19 +1682,17 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
       [
         "-m",
         "piper",
-        "-m",
+        "--model",
         voice,
-        "-f",
-        outputPath,
         "--data-dir",
         dataDir,
         "--download-dir",
         dataDir,
-        "--",
-        String(text || "")
+        "--output_file",
+        outputPath
       ],
       {
-        stdio: ["ignore", "pipe", "pipe"]
+        stdio: ["pipe", "pipe", "pipe"]
       }
     );
 
@@ -1717,12 +1715,21 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
         );
       }
     });
+
+    child.stdin.write(
+      String(text || "")
+    );
+
+    child.stdin.end();
   });
 
   const audio =
     await readFile(outputPath);
 
-  if (!audio.length || !isWav(audio)) {
+  if (
+    !audio.length ||
+    !isWav(audio)
+  ) {
     throw new Error(
       `Piper ${voice} produced invalid/empty WAV`
     );
@@ -1762,10 +1769,7 @@ async function generateLocalPiperTTS(text) {
       "speech.wav"
     );
 
-  const voices = [
-    "en_US-lessac-low",
-    "en_US-lessac-medium"
-  ];
+  const voices = ["en_US-lessac-low"];
 
   let lastError;
 
