@@ -764,10 +764,15 @@ app.use(async (req, res, next) => {
       error.message
     );
 
-    /*
-      Never break the original Telegram route because
-      of the conversational layer.
-    */
+    if (chatId) {
+      await sendMessage(
+        chatId,
+        `⚠️ Assistant request process nahi ho saki.\n\n${String(error.message || error).slice(0, 500)}`
+      ).catch(() => {});
+
+      return res.sendStatus(200);
+    }
+
     return next();
   }
 });
@@ -1529,58 +1534,9 @@ const PIPER_VOICES_FINAL = [
   "en_US-lessac-low"
 ];
 
+const GEMINI_TTS_VOICE = "Kore";
+
 let GEMINI_TTS_QUOTA_BLOCKED_UNTIL = 0;
-
-async function findPiperEspeakDataDir(dataDir) {
-  const candidates = [
-    process.env.ESPEAK_DATA_PATH,
-    join(dataDir, "espeak-ng-data"),
-    join(process.cwd(), "espeak-ng-data")
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      const stat = await import("node:fs/promises").then(m => m.stat(candidate));
-      if (stat.isDirectory()) return candidate;
-    } catch {}
-  }
-
-  try {
-    const discovered = await new Promise((resolve, reject) => {
-      const child = spawn(
-        "python3",
-        [
-          "-c",
-          "import pathlib,piper_phonemize; print(pathlib.Path(piper_phonemize.__file__).resolve().parent / 'espeak-ng-data')"
-        ],
-        { stdio: ["ignore", "pipe", "pipe"] }
-      );
-
-      let stdout = "";
-      let stderr = "";
-
-      child.stdout.on("data", d => { stdout += d.toString(); });
-      child.stderr.on("data", d => { stderr += d.toString(); });
-      child.on("error", reject);
-
-      child.on("close", code => {
-        if (code === 0) resolve(stdout.trim());
-        else reject(new Error(`Piper espeak probe failed: ${stderr.slice(-1000)}`));
-      });
-    });
-
-    const candidate = String(discovered || "").trim();
-
-    if (candidate) {
-      const stat = await import("node:fs/promises").then(m => m.stat(candidate));
-      if (stat.isDirectory()) return candidate;
-    }
-  } catch (error) {
-    console.log("Piper espeak auto-detection failed:", error.message);
-  }
-
-  return null;
-}
 
 async function ensurePiperVoice(dataDir, voice) {
   await mkdir(dataDir, { recursive: true });
@@ -1592,10 +1548,15 @@ async function ensurePiperVoice(dataDir, voice) {
     await readFile(modelPath);
     await readFile(configPath);
 
-    return { modelPath, configPath };
+    return {
+      modelPath,
+      configPath
+    };
   } catch {}
 
-  console.log(`Piper voice missing; downloading ${voice}`);
+  console.log(
+    `Piper voice missing; downloading ${voice}`
+  );
 
   await new Promise((resolve, reject) => {
     const child = spawn(
@@ -1614,29 +1575,41 @@ async function ensurePiperVoice(dataDir, voice) {
 
     let stderr = "";
 
-    child.stderr.on("data", d => {
-      stderr += d.toString();
-    });
-
-    child.on("error", reject);
-
-    child.on("close", code => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(
-          new Error(
-            `Piper voice download failed (${voice}) exit=${code}: ${stderr.slice(-2000)}`
-          )
-        );
+    child.stderr.on(
+      "data",
+      d => {
+        stderr += d.toString();
       }
-    });
+    );
+
+    child.on(
+      "error",
+      reject
+    );
+
+    child.on(
+      "close",
+      code => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(
+            new Error(
+              `Piper voice download failed (${voice}) exit=${code}: ${stderr.slice(-2000)}`
+            )
+          );
+        }
+      }
+    );
   });
 
   await readFile(modelPath);
   await readFile(configPath);
 
-  return { modelPath, configPath };
+  return {
+    modelPath,
+    configPath
+  };
 }
 
 async function runPiperVoice(
@@ -1645,164 +1618,205 @@ async function runPiperVoice(
   dataDir,
   outputPath
 ) {
-  const { modelPath } =
-    await ensurePiperVoice(
-      dataDir,
-      voice
-    );
-
-  const espeakDataDir =
-    await findPiperEspeakDataDir(
-      dataDir
-    );
+  const {
+    modelPath
+  } = await ensurePiperVoice(
+    dataDir,
+    voice
+  );
 
   const env = {
-    ...process.env,
-    ...(espeakDataDir
-      ? {
-          ESPEAK_DATA_PATH:
-            espeakDataDir
-        }
-      : {})
+    ...process.env
   };
 
   /*
-    Python module is tried first because the
-    npm/pip installation is guaranteed to expose it.
-    CLI is the secondary local runner.
+    Prefer the Python Piper module.
+    Do NOT depend on a separate `piper`
+    executable being on PATH.
   */
-  const runners = [
-    {
-      name: "python-module",
-      command: "python3",
-      args: [
-        "-m",
-        "piper",
-        "--model",
-        modelPath,
-        "--data-dir",
-        dataDir,
-        "--download-dir",
-        dataDir,
-        "--output_file",
-        outputPath,
-        "--sentence-silence",
-        "0.05"
-      ]
-    },
-    {
-      name: "piper-command",
-      command: "piper",
-      args: [
-        "--model",
-        modelPath,
-        "--data-dir",
-        dataDir,
-        "--download-dir",
-        dataDir,
-        "--output_file",
-        outputPath,
-        "--sentence-silence",
-        "0.05"
-      ]
-    }
-  ];
 
-  let lastError;
-
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    for (const runner of runners) {
-      try {
-        console.log(
-          `Piper TTS attempt=${attempt} runner=${runner.name} voice=${voice}`
-        );
-
-        await new Promise((resolve, reject) => {
+  try {
+    const discovered =
+      await new Promise(
+        (resolve, reject) => {
           const child = spawn(
-            runner.command,
-            runner.args,
+            "python3",
+            [
+              "-c",
+              "import pathlib,piper_phonemize; print(pathlib.Path(piper_phonemize.__file__).resolve().parent / 'espeak-ng-data')"
+            ],
             {
-              env,
               stdio: [
-                "pipe",
+                "ignore",
                 "pipe",
                 "pipe"
               ]
             }
           );
 
-          let stderr = "";
           let stdout = "";
+          let stderr = "";
 
-          child.stdout.on("data", d => {
-            stdout += d.toString();
-          });
-
-          child.stderr.on("data", d => {
-            stderr += d.toString();
-          });
-
-          child.on("error", reject);
-
-          child.on("close", code => {
-            if (code === 0) {
-              resolve();
-            } else {
-              reject(
-                new Error(
-                  `Piper ${runner.name} exit=${code}: ${stderr.slice(-2500) || stdout.slice(-1000)}`
-                )
-              );
+          child.stdout.on(
+            "data",
+            d => {
+              stdout += d.toString();
             }
-          });
-
-          child.stdin.end(
-            String(text || "")
           );
-        });
 
-        const audio =
-          await readFile(outputPath);
+          child.stderr.on(
+            "data",
+            d => {
+              stderr += d.toString();
+            }
+          );
 
-        if (
-          !audio.length ||
-          !isWav(audio)
-        ) {
-          throw new Error(
-            `Piper ${runner.name} produced invalid/empty WAV`
+          child.on(
+            "error",
+            reject
+          );
+
+          child.on(
+            "close",
+            code => {
+              if (code === 0) {
+                resolve(
+                  stdout.trim()
+                );
+              } else {
+                reject(
+                  new Error(
+                    `Piper eSpeak probe failed: ${stderr.slice(-1000)}`
+                  )
+                );
+              }
+            }
           );
         }
+      );
 
-        return {
-          buffer: audio,
-          mimeType: "audio/wav",
-          model: `piper-${voice}`
-        };
+    if (discovered) {
+      env.ESPEAK_DATA_PATH =
+        String(discovered);
+    }
+  } catch {}
 
-      } catch (error) {
-        lastError = error;
+  let stdout = "";
+  let stderr = "";
 
-        console.error(
-          `Piper ${runner.name} failed:`,
-          error.message
+  await new Promise(
+    (resolve, reject) => {
+      const child = spawn(
+        "python3",
+        [
+          "-m",
+          "piper",
+          "--model",
+          modelPath,
+          "--data-dir",
+          dataDir,
+          "--download-dir",
+          dataDir,
+          "--output_file",
+          outputPath,
+          "--sentence-silence",
+          "0.05"
+        ],
+        {
+          env,
+          stdio: [
+            "pipe",
+            "pipe",
+            "pipe"
+          ]
+        }
+      );
+
+      const timer =
+        setTimeout(
+          () => {
+            child.kill(
+              "SIGKILL"
+            );
+
+            reject(
+              new Error(
+                "PIPER_TIMEOUT_120000MS"
+              )
+            );
+          },
+          120000
         );
-      }
-    }
 
-    if (attempt < 2) {
-      await sleep(1500);
+      child.stdout.on(
+        "data",
+        d => {
+          stdout += d.toString();
+        }
+      );
+
+      child.stderr.on(
+        "data",
+        d => {
+          stderr += d.toString();
+        }
+      );
+
+      child.on(
+        "error",
+        error => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      );
+
+      child.on(
+        "close",
+        code => {
+          clearTimeout(timer);
+
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(
+              new Error(
+                `Piper python module exit=${code}: ${stderr.slice(-2500) || stdout.slice(-1000)}`
+              )
+            );
+          }
+        }
+      );
+
+      child.stdin.end(
+        String(text || "")
+      );
     }
+  );
+
+  const audio =
+    await readFile(
+      outputPath
+    );
+
+  if (
+    !audio.length ||
+    !isWav(audio)
+  ) {
+    throw new Error(
+      "Piper produced invalid/empty WAV"
+    );
   }
 
-  throw (
-    lastError ||
-    new Error(
-      `Piper ${voice} failed`
-    )
-  );
+  return {
+    buffer: audio,
+    mimeType: "audio/wav",
+    model: `piper-${voice}`
+  };
 }
 
-async function generateLocalPiperTTS(text) {
+async function generateLocalPiperTTS(
+  text
+) {
   const workDir =
     await mkdtemp(
       join(
@@ -1827,13 +1841,16 @@ async function generateLocalPiperTTS(text) {
   try {
     await mkdir(
       dataDir,
-      { recursive: true }
+      {
+        recursive: true
+      }
     );
 
     let lastError;
 
     for (
-      const voice of PIPER_VOICES_FINAL
+      const voice
+      of PIPER_VOICES_FINAL
     ) {
       try {
         return await runPiperVoice(
@@ -1855,7 +1872,6 @@ async function generateLocalPiperTTS(text) {
     throw new Error(
       `Local Piper TTS failed for all voices: ${lastError?.message || "unknown error"}`
     );
-
   } finally {
     await rm(
       workDir,
@@ -1863,16 +1879,21 @@ async function generateLocalPiperTTS(text) {
         recursive: true,
         force: true
       }
-    ).catch(() => {});
+    ).catch(
+      () => {}
+    );
   }
 }
 
-function parseRetrySeconds(message) {
+function parseRetrySeconds(
+  message
+) {
   const match =
-    String(message || "")
-      .match(
-        /retry in\s+([0-9]+(?:\.[0-9]+)?)s/i
-      );
+    String(
+      message || ""
+    ).match(
+      /retry in\s+([0-9]+(?:\.[0-9]+)?)s/i
+    );
 
   if (!match) {
     return 60;
@@ -1883,21 +1904,132 @@ function parseRetrySeconds(message) {
     Math.max(
       15,
       Math.ceil(
-        Number(match[1])
+        Number(
+          match[1]
+        )
       )
     )
   );
 }
 
-async function generateTTSWithRetry(text) {
-  /*
-    FINAL TTS PROVIDER CHAIN
+/*
+  Gemini TTS backup.
 
-    1. Piper = free/local primary.
-    2. Gemini = backup only.
-    3. Gemini 429 = quota block, no hammering.
-    4. No paid provider is auto-selected.
-    5. If both free providers fail, pause safely.
+  Gemini returns raw PCM audio:
+  24 kHz / mono / 16-bit.
+
+  We convert it to WAV before storing it.
+*/
+
+async function generateTTSChunk(
+  text,
+  model = TTS_MODELS[0]
+) {
+  const result =
+    await geminiRequest(
+      model,
+      {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text:
+`Read the following text naturally as a YouTube narrator.
+
+Do not add explanations.
+Do not add new information.
+Do not remove information.
+
+TEXT:
+${String(text || "")}`
+              }
+            ]
+          }
+        ],
+
+        generationConfig: {
+          responseModalities: [
+            "AUDIO"
+          ],
+
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName:
+                  GEMINI_TTS_VOICE
+              }
+            },
+
+            languageCode:
+              "en-US"
+          }
+        }
+      },
+      120000
+    );
+
+  const part =
+    result
+      ?.candidates?.[0]
+      ?.content?.parts
+      ?.find(
+        item =>
+          item
+            ?.inlineData
+            ?.data
+      );
+
+  const base64 =
+    part
+      ?.inlineData
+      ?.data;
+
+  if (!base64) {
+    throw new Error(
+      `Gemini TTS returned no audio for model ${model}`
+    );
+  }
+
+  const pcm =
+    Buffer.from(
+      base64,
+      "base64"
+    );
+
+  if (!pcm.length) {
+    throw new Error(
+      `Gemini TTS returned empty audio for model ${model}`
+    );
+  }
+
+  return {
+    buffer:
+      pcmToWav(
+        pcm,
+        24000,
+        1,
+        16
+      ),
+
+    mimeType:
+      "audio/wav",
+
+    model
+  };
+}
+
+async function generateTTSWithRetry(
+  text
+) {
+  /*
+    FINAL FREE TTS CHAIN
+
+    1. Piper local/free first.
+    2. Gemini TTS free backup.
+    3. Gemini 429 => temporary quota block.
+    4. Never auto-select paid TTS.
+    5. If both free providers fail => safe pause.
   */
 
   let piperError;
@@ -1929,14 +2061,15 @@ async function generateTTSWithRetry(text) {
     GEMINI_TTS_QUOTA_BLOCKED_UNTIL
   ) {
     throw new Error(
-      `TTS fallback exhausted. Piper failed: ${piperError?.message || "unknown"}. Gemini TTS is temporarily quota-blocked.`
+      `Free TTS temporarily unavailable. Piper failed: ${piperError?.message || "unknown"}. Gemini TTS quota is temporarily blocked.`
     );
   }
 
   let geminiError;
 
   for (
-    const model of TTS_MODELS
+    const model
+    of TTS_MODELS
   ) {
     try {
       console.log(
@@ -1953,13 +2086,11 @@ async function generateTTSWithRetry(text) {
         `TTS provider success: Gemini model=${model}`
       );
 
-      return {
-        ...result,
-        model
-      };
+      return result;
 
     } catch (error) {
-      geminiError = error;
+      geminiError =
+        error;
 
       console.error(
         `Gemini TTS failed model=${model}:`,
@@ -1995,7 +2126,9 @@ async function generateTTSWithRetry(text) {
         error.status === 503 ||
         error.code === "TIMEOUT"
       ) {
-        await sleep(3000);
+        await sleep(
+          3000
+        );
       }
     }
   }
@@ -2010,7 +2143,6 @@ async function generateTTSWithRetry(text) {
 
   throw finalError;
 }
-
 /* =========================
    WAV HELPERS
 ========================= */
