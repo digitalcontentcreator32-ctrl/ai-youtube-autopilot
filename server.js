@@ -1524,111 +1524,78 @@ function splitIntoChunks(
    TTS
 ========================= */
 
-async function generateTTSChunk(text, model) {
-  const controller = new AbortController();
-  const timeoutMs = 120000;
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+const PIPER_VOICES_FINAL = [
+  "en_US-lessac-medium",
+  "en_US-lessac-low"
+];
+
+let GEMINI_TTS_QUOTA_BLOCKED_UNTIL = 0;
+
+async function findPiperEspeakDataDir(dataDir) {
+  const candidates = [
+    process.env.ESPEAK_DATA_PATH,
+    join(dataDir, "espeak-ng-data"),
+    join(process.cwd(), "espeak-ng-data")
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      const stat = await import("node:fs/promises").then(m => m.stat(candidate));
+      if (stat.isDirectory()) return candidate;
+    } catch {}
+  }
 
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY,
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: `Read the following narration aloud naturally. Only synthesize the spoken narration:\n\n${text}`,
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: "Kore",
-                },
-              },
-            },
-          },
-        }),
-        signal: controller.signal,
-      }
-    );
-
-    const raw = await response.text();
-    if (!response.ok) {
-      const error = new Error(`TTS ${response.status}: ${raw}`);
-      error.status = response.status;
-      throw error;
-    }
-
-    const result = JSON.parse(raw);
-    const audioData = result?.candidates?.[0]?.content?.parts?.find(
-      (part) => part?.inlineData?.data
-    )?.inlineData?.data;
-
-    if (!audioData) {
-      throw new Error(
-        `TTS returned no audio data. Response keys=${Object.keys(result || {}).join(",")}`
+    const discovered = await new Promise((resolve, reject) => {
+      const child = spawn(
+        "python3",
+        [
+          "-c",
+          "import pathlib,piper_phonemize; print(pathlib.Path(piper_phonemize.__file__).resolve().parent / 'espeak-ng-data')"
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] }
       );
+
+      let stdout = "";
+      let stderr = "";
+
+      child.stdout.on("data", d => { stdout += d.toString(); });
+      child.stderr.on("data", d => { stderr += d.toString(); });
+      child.on("error", reject);
+
+      child.on("close", code => {
+        if (code === 0) resolve(stdout.trim());
+        else reject(new Error(`Piper espeak probe failed: ${stderr.slice(-1000)}`));
+      });
+    });
+
+    const candidate = String(discovered || "").trim();
+
+    if (candidate) {
+      const stat = await import("node:fs/promises").then(m => m.stat(candidate));
+      if (stat.isDirectory()) return candidate;
     }
-
-    const pcmBuffer = Buffer.from(audioData, "base64");
-    const buffer = isWav(pcmBuffer)
-      ? pcmBuffer
-      : pcmToWav(pcmBuffer, 24000, 1, 16);
-
-    if (!isWav(buffer)) {
-      throw new Error("TTS audio conversion failed: invalid WAV output");
-    }
-
-    return {
-      buffer,
-      mimeType: "audio/wav",
-      sampleRate: 24000,
-    };
   } catch (error) {
-    if (error.name === "AbortError") {
-      const e = new Error(`TTS_REQUEST_TIMEOUT_${timeoutMs}MS`);
-      e.code = "TIMEOUT";
-      throw e;
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
+    console.log("Piper espeak auto-detection failed:", error.message);
   }
+
+  return null;
 }
 
 async function ensurePiperVoice(dataDir, voice) {
   await mkdir(dataDir, { recursive: true });
 
-  const modelPath = join(
-    dataDir,
-    `${voice}.onnx`
-  );
-
-  const configPath = join(
-    dataDir,
-    `${voice}.onnx.json`
-  );
+  const modelPath = join(dataDir, `${voice}.onnx`);
+  const configPath = join(dataDir, `${voice}.onnx.json`);
 
   try {
     await readFile(modelPath);
     await readFile(configPath);
-    return;
+
+    return { modelPath, configPath };
   } catch {}
 
-  console.log(
-    `Piper voice missing. Downloading ${voice}...`
-  );
+  console.log(`Piper voice missing; downloading ${voice}`);
 
   await new Promise((resolve, reject) => {
     const child = spawn(
@@ -1647,8 +1614,8 @@ async function ensurePiperVoice(dataDir, voice) {
 
     let stderr = "";
 
-    child.stderr.on("data", chunk => {
-      stderr += chunk.toString();
+    child.stderr.on("data", d => {
+      stderr += d.toString();
     });
 
     child.on("error", reject);
@@ -1659,7 +1626,7 @@ async function ensurePiperVoice(dataDir, voice) {
       } else {
         reject(
           new Error(
-            `Piper voice download failed (${voice}), exit=${code}: ${stderr.slice(-1500)}`
+            `Piper voice download failed (${voice}) exit=${code}: ${stderr.slice(-2000)}`
           )
         );
       }
@@ -1668,118 +1635,51 @@ async function ensurePiperVoice(dataDir, voice) {
 
   await readFile(modelPath);
   await readFile(configPath);
+
+  return { modelPath, configPath };
 }
 
-/* PIPER_FINAL_HARDENING_V2 */
-
-/*
-  Final Piper runtime hardening.
-
-  Piper requires its phonemization data at runtime. The Python package
-  bundles espeak-ng-data, but the runtime environment may not expose it
-  automatically. Detect it from the installed package and pass it explicitly.
-*/
-async function findPiperEspeakDataDir(dataDir) {
-  const candidates = [
-    process.env.ESPEAK_DATA_PATH,
-    join(dataDir, "espeak-ng-data"),
-    join(process.cwd(), "espeak-ng-data"),
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      const stat = await import("node:fs/promises").then(m => m.stat(candidate));
-      if (stat.isDirectory()) {
-        return candidate;
-      }
-    } catch {}
-  }
-
-  try {
-    const result = await new Promise((resolve, reject) => {
-      const child = spawn(
-        "python3",
-        [
-          "-c",
-          "import pathlib,piper_phonemize; print(pathlib.Path(piper_phonemize.__file__).resolve().parent / 'espeak-ng-data')"
-        ],
-        {
-          stdio: ["ignore", "pipe", "pipe"]
-        }
-      );
-
-      let stdout = "";
-      let stderr = "";
-
-      child.stdout.on("data", d => {
-        stdout += d.toString();
-      });
-
-      child.stderr.on("data", d => {
-        stderr += d.toString();
-      });
-
-      child.on("error", reject);
-
-      child.on("close", code => {
-        if (code === 0) {
-          resolve(stdout.trim());
-        } else {
-          reject(
-            new Error(
-              `Piper espeak data probe failed: ${stderr.slice(-1000)}`
-            )
-          );
-        }
-      });
-    });
-
-    const discovered = String(result || "").trim();
-
-    if (discovered) {
-      try {
-        const stat = await import("node:fs/promises").then(m => m.stat(discovered));
-        if (stat.isDirectory()) {
-          return discovered;
-        }
-      } catch {}
-    }
-  } catch (error) {
-    console.log(
-      "Piper espeak data auto-detection failed:",
-      error.message
+async function runPiperVoice(
+  text,
+  voice,
+  dataDir,
+  outputPath
+) {
+  const { modelPath } =
+    await ensurePiperVoice(
+      dataDir,
+      voice
     );
-  }
 
-  return null;
-}
-
-async function runPiperVoice(text, voice, dataDir, outputPath) {
   const espeakDataDir =
-    await findPiperEspeakDataDir(dataDir);
+    await findPiperEspeakDataDir(
+      dataDir
+    );
 
-  const runtimeEnv = {
+  const env = {
     ...process.env,
     ...(espeakDataDir
       ? {
-          ESPEAK_DATA_PATH: espeakDataDir
+          ESPEAK_DATA_PATH:
+            espeakDataDir
         }
       : {})
   };
 
-  let lastError;
-
   /*
-    Try the installed Piper executable first.
-    The piper-tts package officially exposes the `piper`
-    console command.
+    Python module is tried first because the
+    npm/pip installation is guaranteed to expose it.
+    CLI is the secondary local runner.
   */
   const runners = [
     {
-      command: "piper",
+      name: "python-module",
+      command: "python3",
       args: [
+        "-m",
+        "piper",
         "--model",
-        join(dataDir, `${voice}.onnx`),
+        modelPath,
         "--data-dir",
         dataDir,
         "--download-dir",
@@ -1791,12 +1691,11 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
       ]
     },
     {
-      command: "python3",
+      name: "piper-command",
+      command: "piper",
       args: [
-        "-m",
-        "piper",
         "--model",
-        join(dataDir, `${voice}.onnx`),
+        modelPath,
         "--data-dir",
         dataDir,
         "--download-dir",
@@ -1809,11 +1708,13 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
     }
   ];
 
+  let lastError;
+
   for (let attempt = 1; attempt <= 2; attempt++) {
     for (const runner of runners) {
       try {
         console.log(
-          `Piper attempt=${attempt} runner=${runner.command} voice=${voice} espeak=${espeakDataDir || "auto/default"}`
+          `Piper TTS attempt=${attempt} runner=${runner.name} voice=${voice}`
         );
 
         await new Promise((resolve, reject) => {
@@ -1821,20 +1722,24 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
             runner.command,
             runner.args,
             {
-              env: runtimeEnv,
-              stdio: ["pipe", "pipe", "pipe"]
+              env,
+              stdio: [
+                "pipe",
+                "pipe",
+                "pipe"
+              ]
             }
           );
 
           let stderr = "";
           let stdout = "";
 
-          child.stdout.on("data", chunk => {
-            stdout += chunk.toString();
+          child.stdout.on("data", d => {
+            stdout += d.toString();
           });
 
-          child.stderr.on("data", chunk => {
-            stderr += chunk.toString();
+          child.stderr.on("data", d => {
+            stderr += d.toString();
           });
 
           child.on("error", reject);
@@ -1845,17 +1750,15 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
             } else {
               reject(
                 new Error(
-                  `Piper runner=${runner.command} voice=${voice} exit=${code}: ${stderr.slice(-3000) || stdout.slice(-1000)}`
+                  `Piper ${runner.name} exit=${code}: ${stderr.slice(-2500) || stdout.slice(-1000)}`
                 )
               );
             }
           });
 
-          child.stdin.write(
+          child.stdin.end(
             String(text || "")
           );
-
-          child.stdin.end();
         });
 
         const audio =
@@ -1866,7 +1769,7 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
           !isWav(audio)
         ) {
           throw new Error(
-            `Piper ${voice} produced invalid/empty WAV`
+            `Piper ${runner.name} produced invalid/empty WAV`
           );
         }
 
@@ -1880,21 +1783,23 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
         lastError = error;
 
         console.error(
-          `Piper runner failed: ${runner.command}, voice=${voice}:`,
+          `Piper ${runner.name} failed:`,
           error.message
         );
       }
     }
 
     if (attempt < 2) {
-      await sleep(2000);
+      await sleep(1500);
     }
   }
 
-  throw lastError ||
+  throw (
+    lastError ||
     new Error(
       `Piper ${voice} failed`
-    );
+    )
+  );
 }
 
 async function generateLocalPiperTTS(text) {
@@ -1913,31 +1818,24 @@ async function generateLocalPiperTTS(text) {
       ".piper-voices"
     );
 
-  await mkdir(
-    dataDir,
-    { recursive: true }
-  );
-
   const outputPath =
     join(
       workDir,
       "speech.wav"
     );
 
-  const voices = [
-    "en_US-lessac-medium",
-    "en_US-lessac-low"
-  ];
-
-  let lastError;
-
   try {
-    for (const voice of voices) {
-      try {
-        console.log(
-          `Trying local Piper voice: ${voice}`
-        );
+    await mkdir(
+      dataDir,
+      { recursive: true }
+    );
 
+    let lastError;
+
+    for (
+      const voice of PIPER_VOICES_FINAL
+    ) {
+      try {
         return await runPiperVoice(
           text,
           voice,
@@ -1948,14 +1846,14 @@ async function generateLocalPiperTTS(text) {
         lastError = error;
 
         console.error(
-          `Local Piper voice failed: ${voice}:`,
+          `Local Piper voice ${voice} failed:`,
           error.message
         );
       }
     }
 
     throw new Error(
-      `Local Piper TTS failed for all voices. ${lastError?.message || ""}`
+      `Local Piper TTS failed for all voices: ${lastError?.message || "unknown error"}`
     );
 
   } finally {
@@ -1969,100 +1867,120 @@ async function generateLocalPiperTTS(text) {
   }
 }
 
-let GEMINI_TTS_QUOTA_BLOCKED_UNTIL = 0;
+function parseRetrySeconds(message) {
+  const match =
+    String(message || "")
+      .match(
+        /retry in\s+([0-9]+(?:\.[0-9]+)?)s/i
+      );
+
+  if (!match) {
+    return 60;
+  }
+
+  return Math.min(
+    300,
+    Math.max(
+      15,
+      Math.ceil(
+        Number(match[1])
+      )
+    )
+  );
+}
 
 async function generateTTSWithRetry(text) {
   /*
-    FINAL TTS POLICY
+    FINAL TTS PROVIDER CHAIN
 
-    1. Local Piper first.
-    2. Gemini only if Piper fails.
-    3. Gemini 429 never causes endless retries.
-    4. No paid provider is called automatically.
+    1. Piper = free/local primary.
+    2. Gemini = backup only.
+    3. Gemini 429 = quota block, no hammering.
+    4. No paid provider is auto-selected.
+    5. If both free providers fail, pause safely.
   */
+
+  let piperError;
 
   try {
+    const result =
+      await generateLocalPiperTTS(
+        text
+      );
+
     console.log(
-      "TTS primary: local Piper"
+      "TTS provider success: Piper",
+      result.model
     );
 
-    return await generateLocalPiperTTS(
-      text
-    );
+    return result;
 
-  } catch (localError) {
+  } catch (error) {
+    piperError = error;
+
     console.error(
-      "Local Piper primary failed:",
-      localError.message
+      "TTS provider failed: Piper:",
+      error.message
     );
-
-    /*
-      Keep the real local-provider failure so that if Gemini
-      also fails, the final job error tells us BOTH reasons.
-    */
-    var localPiperError = localError;
   }
 
-  let lastGeminiError;
-
-  /*
-    Do not repeatedly hit a provider whose quota is already
-    exhausted during the same server lifetime.
-  */
   if (
     Date.now() <
     GEMINI_TTS_QUOTA_BLOCKED_UNTIL
   ) {
-    const blockedError =
-      new Error(
-        "Gemini TTS temporarily blocked after quota exhaustion"
-      );
+    throw new Error(
+      `TTS fallback exhausted. Piper failed: ${piperError?.message || "unknown"}. Gemini TTS is temporarily quota-blocked.`
+    );
+  }
 
-    blockedError.status = 429;
+  let geminiError;
 
-    lastGeminiError = blockedError;
-  } else {
-    for (const model of TTS_MODELS) {
+  for (
+    const model of TTS_MODELS
+  ) {
     try {
       console.log(
-        `TTS backup: Gemini model=${model}`
+        `TTS provider backup: Gemini model=${model}`
+      );
+
+      const result =
+        await generateTTSChunk(
+          text,
+          model
+        );
+
+      console.log(
+        `TTS provider success: Gemini model=${model}`
       );
 
       return {
-        ...(await generateTTSChunk(
-          text,
-          model
-        )),
+        ...result,
         model
       };
 
     } catch (error) {
-      lastGeminiError = error;
+      geminiError = error;
 
       console.error(
-        `Gemini TTS failed: model=${model}, status=${error.status || "none"}:`,
+        `Gemini TTS failed model=${model}:`,
         error.message
       );
 
-      /*
-        429 means quota/rate limit.
-        Do NOT hammer the same project with retries.
-      */
-      if (error.status === 429) {
-        /*
-          Respect the provider's quota window instead of
-          hammering the same API again.
-        */
+      if (
+        error.status === 429
+      ) {
+        const seconds =
+          parseRetrySeconds(
+            error.message
+          );
+
         GEMINI_TTS_QUOTA_BLOCKED_UNTIL =
           Date.now() +
-          60 * 1000;
+          seconds * 1000;
 
         break;
       }
 
-      /*
-        Authentication/request errors are not transient.
-      */
       if (
         error.status === 400 ||
         error.status === 401 ||
@@ -2071,30 +1989,24 @@ async function generateTTSWithRetry(text) {
         break;
       }
 
-      /*
-        Short bounded retry for temporary server errors.
-      */
       if (
         error.status === 500 ||
         error.status === 502 ||
         error.status === 503 ||
         error.code === "TIMEOUT"
       ) {
-        await sleep(
-          5000
-        );
+        await sleep(3000);
       }
-    }
     }
   }
 
   const finalError =
     new Error(
-      `All TTS providers unavailable. Piper: ${localPiperError?.message || "not available"} | Gemini: ${lastGeminiError?.message || "not available"}`
+      `All free TTS providers failed. Piper: ${piperError?.message || "unavailable"} | Gemini: ${geminiError?.message || "unavailable"}`
     );
 
   finalError.code =
-    "TTS_ALL_PROVIDERS_FAILED";
+    "TTS_ALL_FREE_PROVIDERS_FAILED";
 
   throw finalError;
 }
@@ -2320,7 +2232,7 @@ async function processTTS(
 ) {
   const chunks = splitIntoChunks(
     job.script,
-    450
+    320
   );
 
   if (!chunks.length) {

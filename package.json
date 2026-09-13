@@ -1,11 +1,11 @@
 {
   "name": "ai-youtube-autopilot-backend",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "postinstall": "python3 -m pip install --user --break-system-packages --disable-pip-version-check piper-tts && mkdir -p .piper-voices && python3 -m piper.download_voices en_US-lessac-medium --data-dir .piper-voices && python3 -m piper.download_voices en_US-lessac-low --data-dir .piper-voices"
+    "postinstall": "python3 -m pip install --user --break-system-packages --disable-pip-version-check piper-tts && mkdir -p .piper-voices && python3 -m piper.download_voices en_US-lessac-medium --data-dir .piper-voices && python3 -m piper.download_voices en_US-lessac-low --data-dir .piper-voices && printf '%s\\n' 'Piper smoke test' | python3 -m piper --model .piper-voices/en_US-lessac-medium.onnx --data-dir .piper-voices --download-dir .piper-voices --output_file .piper-smoke.wav && test -s .piper-smoke.wav && rm -f .piper-smoke.wav"
   },
   "dependencies": {
     "express": "^5.1.0",
