@@ -1682,8 +1682,10 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
     try {
       await new Promise((resolve, reject) => {
     const child = spawn(
-      "piper",
+      "python3",
       [
+        "-m",
+        "piper",
         "--model",
         join(dataDir, `${voice}.onnx`),
         "--data-dir",
@@ -1834,6 +1836,8 @@ async function generateLocalPiperTTS(text) {
   }
 }
 
+let GEMINI_TTS_QUOTA_BLOCKED_UNTIL = 0;
+
 async function generateTTSWithRetry(text) {
   /*
     FINAL TTS POLICY
@@ -1858,11 +1862,34 @@ async function generateTTSWithRetry(text) {
       "Local Piper primary failed:",
       localError.message
     );
+
+    /*
+      Keep the real local-provider failure so that if Gemini
+      also fails, the final job error tells us BOTH reasons.
+    */
+    var localPiperError = localError;
   }
 
   let lastGeminiError;
 
-  for (const model of TTS_MODELS) {
+  /*
+    Do not repeatedly hit a provider whose quota is already
+    exhausted during the same server lifetime.
+  */
+  if (
+    Date.now() <
+    GEMINI_TTS_QUOTA_BLOCKED_UNTIL
+  ) {
+    const blockedError =
+      new Error(
+        "Gemini TTS temporarily blocked after quota exhaustion"
+      );
+
+    blockedError.status = 429;
+
+    lastGeminiError = blockedError;
+  } else {
+    for (const model of TTS_MODELS) {
     try {
       console.log(
         `TTS backup: Gemini model=${model}`
@@ -1889,6 +1916,14 @@ async function generateTTSWithRetry(text) {
         Do NOT hammer the same project with retries.
       */
       if (error.status === 429) {
+        /*
+          Respect the provider's quota window instead of
+          hammering the same API again.
+        */
+        GEMINI_TTS_QUOTA_BLOCKED_UNTIL =
+          Date.now() +
+          60 * 1000;
+
         break;
       }
 
@@ -1917,11 +1952,12 @@ async function generateTTSWithRetry(text) {
         );
       }
     }
+    }
   }
 
   const finalError =
     new Error(
-      `All TTS providers unavailable. Local Piper and Gemini failed. Gemini: ${lastGeminiError?.message || "not available"}`
+      `All TTS providers unavailable. Local Piper and Gemini failed. Piper: ${localPiperError?.message || "not available"} | Gemini: ${lastGeminiError?.message || "not available"}`
     );
 
   finalError.code =
@@ -3654,6 +3690,106 @@ RULES:
 }
 
 /* =========================
+   PIPER RUNTIME PREFLIGHT
+========================= */
+
+async function verifyPiperRuntime() {
+  const dataDir =
+    process.env.PIPER_DATA_DIR ||
+    join(
+      process.cwd(),
+      ".piper-voices"
+    );
+
+  try {
+    await mkdir(
+      dataDir,
+      { recursive: true }
+    );
+
+    /*
+      Verify the Python module itself is callable.
+      This catches the exact Render PATH problem before
+      a real job reaches TTS.
+    */
+    await new Promise((resolve, reject) => {
+      const child = spawn(
+        "python3",
+        [
+          "-m",
+          "piper",
+          "--help"
+        ],
+        {
+          stdio: ["ignore", "ignore", "pipe"]
+        }
+      );
+
+      let stderr = "";
+
+      child.stderr.on(
+        "data",
+        chunk => {
+          stderr += chunk.toString();
+        }
+      );
+
+      child.on(
+        "error",
+        reject
+      );
+
+      child.on(
+        "close",
+        code => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(
+              new Error(
+                `python3 -m piper failed, exit=${code}: ${stderr.slice(-1200)}`
+              )
+            );
+          }
+        }
+      );
+    });
+
+    /*
+      Verify at least the primary voice files exist.
+      postinstall normally creates them.
+    */
+    await readFile(
+      join(
+        dataDir,
+        "en_US-lessac-medium.onnx"
+      )
+    );
+
+    await readFile(
+      join(
+        dataDir,
+        "en_US-lessac-medium.onnx.json"
+      )
+    );
+
+    console.log(
+      "PIPER PREFLIGHT: READY"
+    );
+
+    return true;
+
+  } catch (error) {
+    console.error(
+      "PIPER PREFLIGHT: NOT READY:",
+      error.message
+    );
+
+    return false;
+  }
+}
+
+/* =========================
    HEALTH CHECK
 ========================= */
 
@@ -3763,40 +3899,109 @@ async function startup() {
           "STARTUP COMPLETE"
         );
 
-        // Resume jobs that were queued/recovered during a previous
-        // process lifetime. Existing completed TTS chunks are reused.
-        setTimeout(async () => {
-          try {
-            const queued = await db(`
-              SELECT id, chat_id
-              FROM jobs
-              WHERE status = 'queued'
-              ORDER BY created_at ASC
-              LIMIT 10
-            `);
+        /*
+          FINAL QUEUE WORKER
 
-            for (const row of queued.rows) {
-              processJob(row.id, row.chat_id).catch(async (error) => {
-                await updateJob(row.id, {
-                  status: "paused",
-                  error: error.message,
-                }).catch(() => {});
+          Never start 10 jobs simultaneously.
+
+          One worker processes one queued job at a time.
+          PostgreSQL still provides the atomic job claim inside
+          processJob(), so duplicate workers cannot own one job.
+
+          This is especially important for:
+          - Gemini quotas
+          - Render free CPU/RAM
+          - Piper CPU usage
+          - FFmpeg CPU usage
+        */
+        setTimeout(async () => {
+          let workerRunning = true;
+
+          while (workerRunning) {
+            try {
+              const queued =
+                await db(`
+                  SELECT
+                    id,
+                    chat_id
+                  FROM jobs
+                  WHERE status = 'queued'
+                  ORDER BY created_at ASC
+                  LIMIT 1
+                `);
+
+              if (!queued.rows.length) {
+                workerRunning = false;
+                break;
+              }
+
+              const row =
+                queued.rows[0];
+
+              try {
+                await processJob(
+                  row.id,
+                  row.chat_id
+                );
+              } catch (error) {
+                console.error(
+                  `Queue worker failed for ${row.id}:`,
+                  error
+                );
+
+                await updateJob(
+                  row.id,
+                  {
+                    status: "paused",
+                    error: error.message
+                  }
+                ).catch(() => {});
 
                 await sendMessage(
                   row.chat_id,
                   `⏸️ JOB PAUSED SAFELY
 
-Reason: ${error.message}
+Reason:
+${String(error.message).slice(0, 1200)}
 
 Resume with:
 /resume ${row.id}`
                 ).catch(() => {});
-              });
+              }
+
+              /*
+                Small yield between jobs.
+              */
+              await sleep(500);
+
+            } catch (error) {
+              console.error(
+                "Queued-job worker database error:",
+                error
+              );
+
+              /*
+                Do not spin forever if PostgreSQL is temporarily
+                unavailable.
+              */
+              await sleep(5000);
             }
-          } catch (error) {
-            console.error("Queued-job recovery failed:", error);
           }
+
+          console.log(
+            "QUEUE WORKER: idle — no queued jobs"
+          );
         }, 1000);
+
+        /*
+          Non-fatal Piper preflight after server startup.
+        */
+        verifyPiperRuntime().catch(
+          error => console.error(
+            "Piper preflight error:",
+            error
+          )
+        );
 
       }
     );
