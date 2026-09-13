@@ -1682,10 +1682,8 @@ async function runPiperVoice(text, voice, dataDir, outputPath) {
     try {
       await new Promise((resolve, reject) => {
     const child = spawn(
-      "python3",
+      "piper",
       [
-        "-m",
-        "piper",
         "--model",
         join(dataDir, `${voice}.onnx`),
         "--data-dir",
