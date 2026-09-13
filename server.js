@@ -1536,6 +1536,20 @@ const PIPER_VOICES_FINAL = [
 
 const GEMINI_TTS_VOICE = "Kore";
 
+/*
+  FINAL PIPER RUNTIME
+  Use a project-local virtualenv so Render build/runtime
+  use exactly the same Python environment.
+*/
+const PIPER_PYTHON =
+  process.env.PIPER_PYTHON ||
+  join(
+    process.cwd(),
+    ".piper-venv",
+    "bin",
+    "python"
+  );
+
 let GEMINI_TTS_QUOTA_BLOCKED_UNTIL = 0;
 
 async function ensurePiperVoice(dataDir, voice) {
@@ -1560,7 +1574,7 @@ async function ensurePiperVoice(dataDir, voice) {
 
   await new Promise((resolve, reject) => {
     const child = spawn(
-      "python3",
+      PIPER_PYTHON,
       [
         "-m",
         "piper.download_voices",
@@ -1640,7 +1654,7 @@ async function runPiperVoice(
       await new Promise(
         (resolve, reject) => {
           const child = spawn(
-            "python3",
+            PIPER_PYTHON,
             [
               "-c",
               "import pathlib,piper_phonemize; print(pathlib.Path(piper_phonemize.__file__).resolve().parent / 'espeak-ng-data')"
@@ -1707,7 +1721,7 @@ async function runPiperVoice(
   await new Promise(
     (resolve, reject) => {
       const child = spawn(
-        "python3",
+        PIPER_PYTHON,
         [
           "-m",
           "piper",
@@ -3891,7 +3905,7 @@ async function verifyPiperRuntime() {
     */
     await new Promise((resolve, reject) => {
       const child = spawn(
-        "python3",
+        PIPER_PYTHON,
         [
           "-m",
           "piper",
