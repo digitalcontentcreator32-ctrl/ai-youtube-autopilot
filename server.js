@@ -724,18 +724,27 @@ async function generateTTSChunk(text, model) {
     const rawBuffer = Buffer.from(audioData, "base64");
 
     const mimeType =
-      audioOutput?.mime_type ||
-      "audio/wav";
+  audioOutput?.mime_type ||
+  "audio/wav";
 
-    const sampleRate =
-      audioOutput?.sample_rate ||
-      24000;
+const normalizedMimeType =
+  String(mimeType)
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
 
-    const buffer = isWav(rawBuffer)
-      ? rawBuffer
-      : mimeType === "audio/l16"
-        ? pcmToWav(rawBuffer, sampleRate, 1, 16)
-        : rawBuffer;
+const parsedRate =
+  String(mimeType).match(/(?:rate|sample[_-]?rate)\s*=\s*(\d+)/i);
+
+const sampleRate =
+  audioOutput?.sample_rate ||
+  (parsedRate ? Number(parsedRate[1]) : 24000);
+
+const buffer = isWav(rawBuffer)
+  ? rawBuffer
+  : normalizedMimeType === "audio/l16"
+    ? pcmToWav(rawBuffer, sampleRate, 1, 16)
+    : rawBuffer;
 
     if (!isWav(buffer)) {
       throw new Error(
