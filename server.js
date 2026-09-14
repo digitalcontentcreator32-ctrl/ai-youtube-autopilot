@@ -12,7 +12,7 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
-const RELIABILITY_FIX_VERSION = "telegram-gemini-tts-final-2026-09-14-v3";
+const RELIABILITY_FIX_VERSION = "telegram-gemini-tts-final-2026-09-14-v4";
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -39,6 +39,10 @@ async function db(query, params = []) {
   return pool.query(query, params);
 }
 
+/* =========================
+   DATABASE
+========================= */
+
 async function initDatabase() {
   console.log("Starting PostgreSQL database initialization...");
 
@@ -59,6 +63,10 @@ async function initDatabase() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+
+  /* =========================
+     JOBS MIGRATION
+  ========================= */
 
   await db(`
     ALTER TABLE jobs
@@ -114,6 +122,10 @@ async function initDatabase() {
     ALTER TABLE jobs
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
   `);
+
+  /* =========================
+     AUDIO CHUNKS TABLE
+  ========================= */
 
   await db(`
     CREATE TABLE IF NOT EXISTS job_audio_chunks (
@@ -175,6 +187,10 @@ async function initDatabase() {
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
   `);
 
+  /* =========================
+     DEFAULT VALUES
+  ========================= */
+
   await db(`
     UPDATE jobs
     SET
@@ -204,6 +220,10 @@ async function initDatabase() {
       updated_at =
         COALESCE(updated_at, NOW())
   `);
+
+  /* =========================
+     FINAL SCHEMA VERIFICATION
+  ========================= */
 
   const check = await db(`
     SELECT column_name
@@ -259,6 +279,10 @@ async function initDatabase() {
   );
 }
 
+/* =========================
+   TELEGRAM
+========================= */
+
 async function telegram(method, body = {}) {
   if (!TELEGRAM_BOT_TOKEN) {
     throw new Error("TELEGRAM_BOT_TOKEN missing");
@@ -279,6 +303,7 @@ async function telegram(method, body = {}) {
     );
 
     const raw = await response.text();
+
     let data;
 
     try {
@@ -295,6 +320,7 @@ async function telegram(method, body = {}) {
       );
 
       error.status = response.status;
+
       throw error;
     }
 
@@ -306,6 +332,7 @@ async function telegram(method, body = {}) {
       );
 
       e.code = "TELEGRAM_TIMEOUT";
+
       throw e;
     }
 
@@ -379,6 +406,10 @@ async function sendDocument(
 
   return data.result;
 }
+
+/* =========================
+   GEMINI REST
+========================= */
 
 async function geminiRequest(
   model,
@@ -509,9 +540,11 @@ async function retryGemini(
   throw lastError;
 }
 
-async function generateScript(
-  topic
-) {
+/* =========================
+   SCRIPT
+========================= */
+
+async function generateScript(topic) {
   const prompt = `
 Create an original YouTube narration script about:
 
@@ -543,7 +576,9 @@ Requirements:
               {
                 role: "user",
                 parts: [
-                  { text: prompt }
+                  {
+                    text: prompt
+                  }
                 ],
               },
             ],
@@ -561,7 +596,7 @@ Requirements:
           ?.candidates?.[0]
           ?.content?.parts
           ?.map(
-            part =>
+            (part) =>
               part.text || ""
           )
           .join("")
@@ -590,9 +625,11 @@ Requirements:
   );
 }
 
-function qualityCheck(
-  script
-) {
+/* =========================
+   QUALITY CHECK
+========================= */
+
+function qualityCheck(script) {
   const words =
     script
       .trim()
@@ -607,6 +644,10 @@ function qualityCheck(
 
   return words.length;
 }
+
+/* =========================
+   TTS CHUNKING
+========================= */
 
 function splitIntoChunks(
   text,
@@ -643,6 +684,7 @@ function splitIntoChunks(
         chunks.push(
           current.join(" ")
         );
+
         current = [];
       }
 
@@ -677,7 +719,9 @@ function splitIntoChunks(
       current = [];
     }
 
-    current.push(...words);
+    current.push(
+      ...words
+    );
   }
 
   if (current.length) {
@@ -688,6 +732,10 @@ function splitIntoChunks(
 
   return chunks;
 }
+
+/* =========================
+   TTS
+========================= */
 
 async function generateTTSChunk(
   text,
@@ -734,8 +782,6 @@ async function generateTTSChunk(
 
       response_format: {
         type: "audio",
-        mime_type: "audio/wav",
-        delivery: "inline",
       },
 
       generation_config: {
@@ -757,18 +803,16 @@ async function generateTTSChunk(
         "https://generativelanguage.googleapis.com/v1beta/interactions",
         {
           method: "POST",
-
           headers: {
             "Content-Type":
               "application/json",
-
             "x-goog-api-key":
               GEMINI_API_KEY,
           },
-
           body:
-            JSON.stringify(payload),
-
+            JSON.stringify(
+              payload
+            ),
           signal:
             controller.signal,
         }
@@ -785,7 +829,8 @@ async function generateTTSChunk(
           JSON.parse(raw);
 
         detail =
-          parsed?.error?.message ||
+          parsed?.error
+            ?.message ||
           parsed?.message ||
           raw;
       } catch {}
@@ -816,7 +861,7 @@ async function generateTTSChunk(
       result?.output_audio ||
       result?.steps
         ?.flatMap(
-          step =>
+          (step) =>
             Array.isArray(
               step?.content
             )
@@ -824,7 +869,7 @@ async function generateTTSChunk(
               : []
         )
         .find(
-          item =>
+          (item) =>
             item?.type ===
             "audio"
         );
@@ -861,6 +906,10 @@ async function generateTTSChunk(
         audio?.channels
       ) || 1;
 
+    const mimeType =
+      audio?.mime_type ||
+      "audio/wav";
+
     const wavBuffer =
       isWav(buffer)
         ? buffer
@@ -872,8 +921,10 @@ async function generateTTSChunk(
           );
 
     return {
-      buffer: wavBuffer,
-      mimeType: "audio/wav",
+      buffer:
+        wavBuffer,
+      mimeType:
+        "audio/wav",
       sampleRate,
     };
   } catch (error) {
@@ -886,7 +937,8 @@ async function generateTTSChunk(
           `TTS_REQUEST_TIMEOUT_${timeoutMs}MS`
         );
 
-      e.code = "TIMEOUT";
+      e.code =
+        "TIMEOUT";
 
       throw e;
     }
@@ -923,7 +975,8 @@ async function generateTTSWithRetry(
           model,
         };
       } catch (error) {
-        lastError = error;
+        lastError =
+          error;
 
         console.log(
           `TTS failed: model=${model}, attempt=${attempt}, error=${error.message}`
@@ -932,18 +985,25 @@ async function generateTTSWithRetry(
         const retryable =
           error.code ===
             "TIMEOUT" ||
-          error.status === 429 ||
-          error.status === 500 ||
-          error.status === 502 ||
-          error.status === 503;
+          error.status ===
+            429 ||
+          error.status ===
+            500 ||
+          error.status ===
+            502 ||
+          error.status ===
+            503;
 
-        if (!retryable) break;
+        if (!retryable) {
+          break;
+        }
 
         if (attempt < 3) {
           const wait =
             3000 +
             Math.floor(
-              Math.random() * 5000
+              Math.random() *
+                5000
             );
 
           await sleep(wait);
@@ -959,6 +1019,10 @@ async function generateTTSWithRetry(
     )
   );
 }
+
+/* =========================
+   WAV HELPERS
+========================= */
 
 function isWav(buffer) {
   return (
@@ -983,7 +1047,8 @@ function pcmToWav(
   bits = 16
 ) {
   const blockAlign =
-    (channels * bits) / 8;
+    (channels * bits) /
+    8;
 
   const byteRate =
     sampleRate *
@@ -1006,11 +1071,7 @@ function pcmToWav(
     "WAVE",
     8
   );
-
-  header.write(
-    "fmt ",
-    12
-  );
+header.write("fmt ", 12);
 
   header.writeUInt32LE(
     16,
@@ -1106,7 +1167,8 @@ function getWavPcm(wav) {
   throw new Error(
     "WAV data chunk not found"
   );
-      }
+}
+
 function getWavFormat(wav) {
   if (
     !isWav(wav) ||
@@ -1120,9 +1182,14 @@ function getWavFormat(wav) {
   }
 
   return {
-    sampleRate: wav.readUInt32LE(24),
-    channels: wav.readUInt16LE(22),
-    bits: wav.readUInt16LE(34),
+    sampleRate:
+      wav.readUInt32LE(24),
+
+    channels:
+      wav.readUInt16LE(22),
+
+    bits:
+      wav.readUInt16LE(34),
   };
 }
 
@@ -1143,7 +1210,9 @@ function concatWavBuffers(
         );
 
   const format =
-    getWavFormat(first);
+    getWavFormat(
+      first
+    );
 
   const pcm =
     Buffer.concat(
@@ -1159,6 +1228,10 @@ function concatWavBuffers(
     format.bits
   );
 }
+
+/* =========================
+   JOB HELPERS
+========================= */
 
 async function getJob(id) {
   const result =
@@ -1180,7 +1253,9 @@ async function updateJob(
   const entries =
     Object.entries(fields);
 
-  if (!entries.length) return;
+  if (!entries.length) {
+    return;
+  }
 
   const allowed =
     new Set([
@@ -1201,7 +1276,7 @@ async function updateJob(
 
   for (
     const [key, value]
-    of entries
+      of entries
   ) {
     if (!allowed.has(key)) {
       throw new Error(
@@ -1228,6 +1303,10 @@ async function updateJob(
     values
   );
 }
+
+/* =========================
+   TTS JOB PROCESSOR
+========================= */
 
 async function processTTS(
   job,
@@ -1277,7 +1356,10 @@ async function processTTS(
         WHERE job_id = $1
           AND chunk_index = $2
         `,
-        [job.id, i]
+        [
+          job.id,
+          i,
+        ]
       );
 
     if (
@@ -1362,7 +1444,8 @@ async function processTTS(
             COUNT(*)::int AS count
           FROM job_audio_chunks
           WHERE job_id = $1
-            AND status = 'completed'
+            AND status =
+              'completed'
           `,
           [job.id]
         );
@@ -1376,10 +1459,9 @@ async function processTTS(
           85,
           55 +
             Math.floor(
-              (
-                completed /
-                chunks.length
-              ) * 30
+              (completed /
+                chunks.length) *
+                30
             )
         );
 
@@ -1468,8 +1550,10 @@ Resume with:
         audio_data
       FROM job_audio_chunks
       WHERE job_id = $1
-        AND status = 'completed'
-      ORDER BY chunk_index ASC
+        AND status =
+          'completed'
+      ORDER BY
+        chunk_index ASC
       `,
       [job.id]
     );
@@ -1486,7 +1570,7 @@ Resume with:
   const audio =
     concatWavBuffers(
       audioRows.rows.map(
-        row =>
+        (row) =>
           row.audio_data
       )
     );
@@ -1499,27 +1583,9 @@ Resume with:
     audio.length >
     49 * 1024 * 1024
   ) {
-    await updateJob(
-      job.id,
-      {
-        status:
-          "completed",
-        stage:
-          "tts_complete",
-        progress:
-          100,
-        tts_completed_chunks:
-          chunks.length,
-        error: null,
-      }
+    throw new Error(
+      "Narration WAV is above Telegram's upload limit"
     );
-
-    await sendMessage(
-      targetChat,
-      "⚠️ Narration completed, but the WAV file is above Telegram's upload limit."
-    );
-
-    return true;
   }
 
   await sendDocument(
@@ -1536,13 +1602,18 @@ Job: ${job.id}`
     {
       status:
         "completed",
+
       stage:
         "tts_complete",
+
       progress:
         100,
+
       tts_completed_chunks:
         chunks.length,
-      error: null,
+
+      error:
+        null,
     }
   );
 
@@ -1550,12 +1621,15 @@ Job: ${job.id}`
     targetChat,
     `✅ TTS COMPLETED
 
-${chunks.length} narration chunks generated.
-Audio file sent successfully.`
+${chunks.length} narration chunks generated and delivered.`
   );
 
   return true;
 }
+
+/* =========================
+   FULL JOB
+========================= */
 
 const activeJobs =
   new Set();
@@ -1571,7 +1645,10 @@ async function claimJob(
       SET
         status = 'running',
         chat_id =
-          COALESCE($2, chat_id),
+          COALESCE(
+            $2,
+            chat_id
+          ),
         error = NULL,
         updated_at = NOW()
       WHERE id = $1
@@ -1651,8 +1728,10 @@ async function processJob(
       await updateJob(
         id,
         {
-          stage: "script",
-          progress: 10,
+          stage:
+            "script",
+          progress:
+            10,
         }
       );
 
@@ -1676,19 +1755,23 @@ async function processJob(
         {
           script:
             result.script,
+
           progress:
             40,
+
           stage:
-            "script_complete",
+            "script_complete"
         }
       );
 
       await updateJob(
         id,
         {
-          progress: 50,
+          progress:
+            50,
+
           stage:
-            "quality_checked",
+            "quality_checked"
         }
       );
 
@@ -1704,10 +1787,17 @@ async function processJob(
     await updateJob(
       id,
       {
-        stage: "tts",
-        progress: 55,
-        status: "running",
-        error: null,
+        stage:
+          "tts",
+
+        progress:
+          55,
+
+        status:
+          "running",
+
+        error:
+          null,
       }
     );
 
@@ -1724,6 +1814,10 @@ async function processJob(
     activeJobs.delete(id);
   }
 }
+
+/* =========================
+   CREATE
+========================= */
 
 async function createJob(
   topic,
@@ -1773,7 +1867,7 @@ Job ID: ${id}`
     id,
     chatId
   ).catch(
-    async error => {
+    async (error) => {
       console.error(
         "Background job error:",
         error
@@ -1808,6 +1902,10 @@ Resume with:
   return id;
 }
 
+/* =========================
+   RESUME
+========================= */
+
 async function resumeJob(
   id,
   chatId
@@ -1826,9 +1924,7 @@ async function resumeJob(
 
   if (
     job.chat_id &&
-    String(
-      job.chat_id
-    ) !==
+    String(job.chat_id) !==
       String(chatId)
   ) {
     await sendMessage(
@@ -1869,9 +1965,12 @@ async function resumeJob(
       chat_id:
         chatId ||
         job.chat_id,
+
       status:
         "queued",
-      error: null,
+
+      error:
+        null,
     }
   );
 
@@ -1888,14 +1987,14 @@ Saved script and completed TTS chunks will be reused.`
     id,
     chatId
   ).catch(
-    async error => {
+    async (error) => {
       await updateJob(
         id,
         {
           status:
             "paused",
           error:
-            error.message,
+            error.message
         }
       ).catch(
         () => {}
@@ -1903,18 +2002,17 @@ Saved script and completed TTS chunks will be reused.`
 
       await sendMessage(
         chatId,
-        `⏸️ JOB PAUSED SAFELY
-
-Reason: ${error.message}
-
-Resume with:
-/resume ${id}`
+        `⏸️ JOB PAUSED SAFELY\n\nReason: ${error.message}\n\nResume with:\n/resume ${id}`
       ).catch(
         () => {}
       );
     }
   );
 }
+
+/* =========================
+   STATUS
+========================= */
 
 async function status(
   chatId
@@ -1923,21 +2021,25 @@ async function status(
     await db(
       `
       SELECT
-        COUNT(*) FILTER
-          (WHERE status = 'running')::int
-          AS running,
+        COUNT(*) FILTER (
+          WHERE status =
+            'running'
+        )::int AS running,
 
-        COUNT(*) FILTER
-          (WHERE status = 'paused')::int
-          AS paused,
+        COUNT(*) FILTER (
+          WHERE status =
+            'paused'
+        )::int AS paused,
 
-        COUNT(*) FILTER
-          (WHERE status = 'completed')::int
-          AS completed,
+        COUNT(*) FILTER (
+          WHERE status =
+            'completed'
+        )::int AS completed,
 
-        COUNT(*) FILTER
-          (WHERE status = 'queued')::int
-          AS queued,
+        COUNT(*) FILTER (
+          WHERE status =
+            'queued'
+        )::int AS queued,
 
         COUNT(*)::int AS total
 
@@ -1967,6 +2069,10 @@ Payment mode: APPROVAL ONLY`
   );
 }
 
+/* =========================
+   TELEGRAM WEBHOOK
+========================= */
+
 app.post(
   "/telegram/webhook",
   async (
@@ -1978,8 +2084,7 @@ app.post(
         WEBHOOK_SECRET &&
         req.get(
           "X-Telegram-Bot-Api-Secret-Token"
-        ) !==
-          WEBHOOK_SECRET
+        ) !== WEBHOOK_SECRET
       ) {
         console.log(
           "Rejected Telegram webhook: invalid secret"
@@ -1991,7 +2096,8 @@ app.post(
       }
 
       const updateId =
-        req.body?.update_id;
+        req.body
+          ?.update_id;
 
       if (
         updateId !==
@@ -2001,13 +2107,16 @@ app.post(
         const claimed =
           await db(
             `
-            INSERT INTO telegram_updates
+            INSERT INTO
+              telegram_updates
               (update_id)
-            VALUES ($1)
+            VALUES
+              ($1)
             ON CONFLICT
               (update_id)
             DO NOTHING
-            RETURNING update_id
+            RETURNING
+              update_id
             `,
             [updateId]
           );
@@ -2021,7 +2130,9 @@ app.post(
         }
       }
 
-      res.sendStatus(200);
+      res.sendStatus(
+        200
+      );
 
       const message =
         req.body?.message;
@@ -2147,11 +2258,17 @@ Use:
       if (
         !res.headersSent
       ) {
-        res.sendStatus(500);
+        res.sendStatus(
+          500
+        );
       }
     }
   }
 );
+
+/* =========================
+   HEALTH CHECK
+========================= */
 
 app.get(
   "/",
@@ -2169,9 +2286,17 @@ app.get(
   }
 );
 
+/* =========================
+   STARTUP
+========================= */
+
 async function startup() {
   try {
     await initDatabase();
+
+    /* =====================
+       TELEGRAM WEBHOOK
+    ===================== */
 
     if (
       WEBHOOK_URL &&
@@ -2182,21 +2307,19 @@ async function startup() {
         WEBHOOK_URL
       );
 
-      const webhookBody =
-        {
-          url:
-            WEBHOOK_URL,
-          allowed_updates:
-            [
-              "message",
-            ],
-        };
+      const webhookBody = {
+        url:
+          WEBHOOK_URL,
+
+        allowed_updates: [
+          "message",
+        ],
+      };
 
       if (
         WEBHOOK_SECRET
       ) {
-        webhookBody
-          .secret_token =
+        webhookBody.secret_token =
           WEBHOOK_SECRET;
       }
 
@@ -2210,14 +2333,21 @@ async function startup() {
       );
     }
 
+    /* =====================
+       RECOVERY
+    ===================== */
+
     const recovery =
       await db(
         `
         UPDATE jobs
         SET
-          status = 'queued',
-          updated_at = NOW()
-        WHERE status = 'running'
+          status =
+            'queued',
+          updated_at =
+            NOW()
+        WHERE status =
+          'running'
         RETURNING id
         `
       );
@@ -2233,8 +2363,10 @@ async function startup() {
           id,
           chat_id
         FROM jobs
-        WHERE status = 'queued'
-        ORDER BY created_at ASC
+        WHERE status =
+          'queued'
+        ORDER BY
+          created_at ASC
         LIMIT 20
         `
       );
@@ -2247,7 +2379,7 @@ async function startup() {
         row.id,
         row.chat_id
       ).catch(
-        async error => {
+        async (error) => {
           console.error(
             `Recovered job ${row.id} failed:`,
             error
@@ -2259,7 +2391,7 @@ async function startup() {
               status:
                 "paused",
               error:
-                error.message,
+                error.message
             }
           ).catch(
             () => {}
@@ -2271,6 +2403,10 @@ async function startup() {
     console.log(
       `Started ${queued.rows.length} queued job(s) after startup`
     );
+
+    /* =====================
+       SERVER
+    ===================== */
 
     app.listen(
       PORT,
@@ -2298,12 +2434,18 @@ async function startup() {
   }
 }
 
+/* =========================
+   SAFE SHUTDOWN
+========================= */
+
 process.on(
   "SIGTERM",
   async () => {
     await pool
       .end()
-      .catch(() => {});
+      .catch(
+        () => {}
+      );
 
     process.exit(0);
   }
@@ -2314,10 +2456,16 @@ process.on(
   async () => {
     await pool
       .end()
-      .catch(() => {});
+      .catch(
+        () => {}
+      );
 
     process.exit(0);
   }
 );
+
+/* =========================
+   START
+========================= */
 
 startup();
