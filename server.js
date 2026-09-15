@@ -20,14 +20,16 @@ const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  ssl: process.env.DATABASE_URL
+    ? { rejectUnauthorized: false }
+    : false,
   connectionTimeoutMillis: 15000,
 });
 
 const SCRIPT_MODELS = [
-  "gemini-3.5-flash",
-  "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
+  "gemini-3.5-flash-lite",
+  "gemini-3.5-flash",
   "gemini-2.5-flash",
 ];
 
@@ -37,7 +39,8 @@ const TTS_MODELS = [
   "gemini-2.5-pro-preview-tts",
 ];
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 async function db(query, params = []) {
   return pool.query(query, params);
@@ -48,7 +51,9 @@ async function db(query, params = []) {
 ========================= */
 
 async function initDatabase() {
-  console.log("Starting PostgreSQL database initialization...");
+  console.log(
+    "Starting PostgreSQL database initialization..."
+  );
 
   await db(`
     CREATE TABLE IF NOT EXISTS jobs (
@@ -63,11 +68,14 @@ async function initDatabase() {
       tts_total_chunks INTEGER DEFAULT 0,
       tts_completed_chunks INTEGER DEFAULT 0,
       tts_current_chunk INTEGER DEFAULT 0,
-      tts_chunk_size INTEGER DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+
+  /* =========================
+     JOBS MIGRATION
+  ========================= */
 
   await db(`
     ALTER TABLE jobs
@@ -119,24 +127,62 @@ async function initDatabase() {
     ADD COLUMN IF NOT EXISTS tts_chunk_size INTEGER DEFAULT 0
   `);
 
-  await db(`CREATE TABLE IF NOT EXISTS job_media (job_id TEXT NOT NULL, kind TEXT NOT NULL, data BYTEA NOT NULL, mime_type TEXT NOT NULL, sha256 TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (job_id, kind))`);
-
-  // Older deployments may already have job_media without these columns.
-  await db(`ALTER TABLE job_media ADD COLUMN IF NOT EXISTS sha256 TEXT`);
-  await db(`ALTER TABLE job_media ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
-  await db(`ALTER TABLE job_media ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-
-  await db(`CREATE TABLE IF NOT EXISTS telegram_updates (update_id BIGINT PRIMARY KEY, received_at TIMESTAMPTZ DEFAULT NOW())`);
+  /* =========================
+     MEDIA TABLE
+  ========================= */
 
   await db(`
-    ALTER TABLE jobs
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+    CREATE TABLE IF NOT EXISTS job_media (
+      job_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      data BYTEA NOT NULL,
+      mime_type TEXT NOT NULL,
+      sha256 TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (job_id, kind)
+    )
+  `);
+
+  await db(`
+    ALTER TABLE job_media
+    ADD COLUMN IF NOT EXISTS sha256 TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_media
+    ADD COLUMN IF NOT EXISTS created_at
+    TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    ALTER TABLE job_media
+    ADD COLUMN IF NOT EXISTS updated_at
+    TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS telegram_updates (
+      update_id BIGINT PRIMARY KEY,
+      received_at TIMESTAMPTZ DEFAULT NOW()
+    )
   `);
 
   await db(`
     ALTER TABLE jobs
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+    ADD COLUMN IF NOT EXISTS created_at
+    TIMESTAMPTZ DEFAULT NOW()
   `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS updated_at
+    TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  /* =========================
+     AUDIO CHUNKS TABLE
+  ========================= */
 
   await db(`
     CREATE TABLE IF NOT EXISTS job_audio_chunks (
@@ -190,33 +236,53 @@ async function initDatabase() {
 
   await db(`
     ALTER TABLE job_audio_chunks
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+    ADD COLUMN IF NOT EXISTS created_at
+    TIMESTAMPTZ DEFAULT NOW()
   `);
 
   await db(`
     ALTER TABLE job_audio_chunks
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+    ADD COLUMN IF NOT EXISTS updated_at
+    TIMESTAMPTZ DEFAULT NOW()
   `);
+
+  /* =========================
+     DEFAULT VALUES
+  ========================= */
 
   await db(`
     UPDATE jobs
     SET
-      tts_total_chunks = COALESCE(tts_total_chunks, 0),
-      tts_completed_chunks = COALESCE(tts_completed_chunks, 0),
-      tts_current_chunk = COALESCE(tts_current_chunk, 0),
-      progress = COALESCE(progress, 0),
-      stage = COALESCE(stage, 'queued'),
-      status = COALESCE(status, 'queued'),
-      updated_at = COALESCE(updated_at, NOW())
+      tts_total_chunks =
+        COALESCE(tts_total_chunks, 0),
+      tts_completed_chunks =
+        COALESCE(tts_completed_chunks, 0),
+      tts_current_chunk =
+        COALESCE(tts_current_chunk, 0),
+      progress =
+        COALESCE(progress, 0),
+      stage =
+        COALESCE(stage, 'queued'),
+      status =
+        COALESCE(status, 'queued'),
+      updated_at =
+        COALESCE(updated_at, NOW())
   `);
 
   await db(`
     UPDATE job_audio_chunks
     SET
-      status = COALESCE(status, 'pending'),
-      created_at = COALESCE(created_at, NOW()),
-      updated_at = COALESCE(updated_at, NOW())
+      status =
+        COALESCE(status, 'pending'),
+      created_at =
+        COALESCE(created_at, NOW()),
+      updated_at =
+        COALESCE(updated_at, NOW())
   `);
+
+  /* =========================
+     SCHEMA VERIFICATION
+  ========================= */
 
   const check = await db(`
     SELECT column_name
@@ -226,7 +292,9 @@ async function initDatabase() {
     ORDER BY ordinal_position
   `);
 
-  const columns = check.rows.map(row => row.column_name);
+  const columns = check.rows.map(
+    (row) => row.column_name
+  );
 
   const required = [
     "job_id",
@@ -237,11 +305,11 @@ async function initDatabase() {
     "model",
     "error",
     "created_at",
-    "updated_at"
+    "updated_at",
   ];
 
   const missing = required.filter(
-    column => !columns.includes(column)
+    (column) => !columns.includes(column)
   );
 
   if (missing.length > 0) {
@@ -273,7 +341,9 @@ async function telegram(method, body = {}) {
     `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify(body),
     }
   );
@@ -281,14 +351,19 @@ async function telegram(method, body = {}) {
   const raw = await response.text();
 
   let data;
+
   try {
     data = JSON.parse(raw);
   } catch {
-    throw new Error(`Telegram invalid response: ${raw}`);
+    throw new Error(
+      `Telegram invalid response: ${raw}`
+    );
   }
 
   if (!data.ok) {
-    throw new Error(`Telegram API error: ${raw}`);
+    throw new Error(
+      `Telegram API error: ${raw}`
+    );
   }
 
   return data.result;
@@ -315,16 +390,24 @@ async function sendDocument(
 
   const form = new FormData();
 
-  form.append("chat_id", String(chatId));
+  form.append(
+    "chat_id",
+    String(chatId)
+  );
 
   form.append(
     "document",
-    new Blob([buffer], { type: mimeType }),
+    new Blob([buffer], {
+      type: mimeType,
+    }),
     filename
   );
 
   if (caption) {
-    form.append("caption", caption);
+    form.append(
+      "caption",
+      caption
+    );
   }
 
   const response = await fetch(
@@ -356,10 +439,13 @@ async function geminiRequest(
   timeoutMs = 45000
 ) {
   if (!GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY missing");
+    throw new Error(
+      "GEMINI_API_KEY missing"
+    );
   }
 
-  const controller = new AbortController();
+  const controller =
+    new AbortController();
 
   const timer = setTimeout(
     () => controller.abort(),
@@ -372,39 +458,50 @@ async function geminiRequest(
       {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY,
+          "Content-Type":
+            "application/json",
+          "x-goog-api-key":
+            GEMINI_API_KEY,
         },
         body: JSON.stringify(body),
         signal: controller.signal,
       }
     );
 
-    const raw = await response.text();
+    const raw =
+      await response.text();
 
     if (!response.ok) {
       const error = new Error(
         `Gemini ${response.status}: ${raw}`
       );
 
-      error.status = response.status;
+      error.status =
+        response.status;
 
       throw error;
     }
 
     return JSON.parse(raw);
-  } catch (error) {
-    if (error.name === "AbortError") {
-      const timeoutError = new Error(
-        `REQUEST_TIMEOUT_${timeoutMs}MS`
-      );
 
-      timeoutError.code = "TIMEOUT";
+  } catch (error) {
+    if (
+      error.name ===
+      "AbortError"
+    ) {
+      const timeoutError =
+        new Error(
+          `REQUEST_TIMEOUT_${timeoutMs}MS`
+        );
+
+      timeoutError.code =
+        "TIMEOUT";
 
       throw timeoutError;
     }
 
     throw error;
+
   } finally {
     clearTimeout(timer);
   }
@@ -416,6 +513,55 @@ async function retryGemini(
   timeoutMs = 45000,
   maxAttempts = 2
 ) {
+  let lastError;
+
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
+  ) {
+    try {
+      return await geminiRequest(
+        model,
+        body,
+        timeoutMs
+      );
+
+    } catch (error) {
+      lastError = error;
+
+      const retryable =
+        error.code === "TIMEOUT" ||
+        error.status === 429 ||
+        error.status === 500 ||
+        error.status === 502 ||
+        error.status === 503;
+
+      if (
+        !retryable ||
+        attempt === maxAttempts
+      ) {
+        throw error;
+      }
+
+      const wait =
+        3000 +
+        Math.floor(
+          Math.random() * 4000
+        );
+
+      console.log(
+        `Gemini retry in ${wait}ms after: ${error.message}`
+      );
+
+      await sleep(wait);
+    }
+  }
+
+  throw lastError;
+}
+maxAttempts = 2
+  ) {
   let lastError;
 
   for (
@@ -550,7 +696,7 @@ function qualityCheck(script) {
 
 function splitIntoChunks(
   text,
-  maxWords = 450
+  maxWords = 180
 ) {
   const clean = String(text || "")
     .replace(/\s+/g, " ")
@@ -641,7 +787,7 @@ async function generateTTSChunk(text, model) {
             speech_config: [
               {
                 voice: "Kore",
-                language: "en-US",
+                language: /[\u0900-\u097F]/.test(String(text)) ? "hi-IN" : "en-US",
               },
             ],
           },
@@ -664,6 +810,10 @@ async function generateTTSChunk(text, model) {
 
     const result = JSON.parse(raw);
 
+    // IMPORTANT: Current Interactions REST responses put model output
+    // inside `steps[].content[]`. `output_audio` is SDK-only, and `outputs[]`
+    // belongs to older/other response shapes. Support both so the pipeline
+    // remains robust across API revisions.
     const stepContent = Array.isArray(result?.steps)
       ? result.steps.flatMap((step) =>
           Array.isArray(step?.content) ? step.content : []
@@ -695,27 +845,24 @@ async function generateTTSChunk(text, model) {
 
     const rawBuffer = Buffer.from(audioData, "base64");
     const mimeType =
-      audioOutput?.mime_type ||
-      "audio/wav";
-
-    const normalizedMimeType =
-      String(mimeType)
+      String(audioOutput?.mime_type || "audio/wav")
         .split(";")[0]
         .trim()
         .toLowerCase();
 
     const parsedRate =
-      String(mimeType).match(
-        /(?:rate|sample[_-]?rate)\s*=\s*(\d+)/i
-      );
+      String(audioOutput?.mime_type || "")
+        .match(/(?:rate|sample[_-]?rate)\s*=\s*(\d+)/i);
 
     const sampleRate =
       audioOutput?.sample_rate ||
       (parsedRate ? Number(parsedRate[1]) : 24000);
 
+    // WAV is the requested/default format. If the API ever returns raw
+    // 16-bit PCM/L16, wrap it in a WAV container before storing it.
     const buffer = isWav(rawBuffer)
       ? rawBuffer
-      : normalizedMimeType === "audio/l16"
+      : mimeType === "audio/l16"
         ? pcmToWav(rawBuffer, sampleRate, 1, 16)
         : rawBuffer;
 
@@ -745,49 +892,133 @@ async function generateTTSChunk(text, model) {
   } finally {
     clearTimeout(timer);
   }
-    }
-async function generateTTSWithRetry(text) {
+}
+
+function isContentBlockedError(error) {
+  const text = String(error?.message || "").toLowerCase();
+  return (
+    text.includes("content_blocked") ||
+    text.includes("request blocked") ||
+    text.includes("policy reason")
+  );
+}
+
+async function rewriteForSafeTTS(text) {
+  const prompt = `
+Rewrite the following narration for a general-audience educational YouTube voice-over.
+Keep the factual meaning and topic.
+Use calm, neutral, non-graphic wording.
+Remove or replace sensitive or potentially policy-triggering details.
+Do not add new facts.
+Return ONLY the rewritten narration.
+
+TEXT:
+${text}
+`;
+
   let lastError;
 
-  for (const model of TTS_MODELS) {
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        return {
-          ...(await generateTTSChunk(text, model)),
-          model
-        };
-      } catch (error) {
-        lastError = error;
+  for (const model of SCRIPT_MODELS.slice(0, 2)) {
+    try {
+      const result = await retryGemini(
+        model,
+        {
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: prompt }],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 1200,
+          },
+        },
+        30000,
+        2
+      );
 
-        const retryable =
-          error.code === "TIMEOUT" ||
-          [429, 500, 502, 503].includes(error.status);
+      const rewritten = result?.candidates?.[0]?.content?.parts
+        ?.map((part) => part.text || "")
+        .join("")
+        .trim();
 
-        console.log(
-          `TTS failed model=${model} attempt=${attempt} status=${error.status || "none"}: ${error.message}`
-        );
-
-        if (!retryable) throw error;
-
-        if (attempt < 3) {
-          await sleep(
-            error.status === 429
-              ? 8000 * attempt
-              : 3000 + Math.floor(Math.random() * 3000)
-          );
-        }
-      }
+      if (rewritten) return rewritten;
+    } catch (error) {
+      lastError = error;
+      console.log(`Safe TTS rewrite failed: ${error.message}`);
     }
   }
 
-  throw lastError ||
-    new Error("All TTS models failed");
+  throw lastError || new Error("Safe TTS rewrite failed");
+}
+
+async function generateTTSWithRetry(text) {
+  let lastError;
+  let currentText = String(text || "").trim();
+
+  if (!currentText) {
+    throw new Error("Empty TTS chunk");
+  }
+
+  for (let safetyPass = 0; safetyPass < 2; safetyPass++) {
+    for (const model of TTS_MODELS) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          return {
+            ...(await generateTTSChunk(currentText, model)),
+            model,
+            textUsed: currentText,
+          };
+        } catch (error) {
+          lastError = error;
+
+          if (isContentBlockedError(error)) {
+            console.log(
+              `TTS content blocked model=${model} pass=${safetyPass + 1}`
+            );
+            break;
+          }
+
+          const retryable =
+            error.code === "TIMEOUT" ||
+            [429, 500, 502, 503].includes(error.status);
+
+          console.log(
+            `TTS failed model=${model} attempt=${attempt} status=${error.status || "none"}: ${error.message}`
+          );
+
+          if (!retryable || attempt === 3) {
+            break;
+          }
+
+          const wait =
+            error.status === 429
+              ? 5000 * attempt
+              : 2000 + Math.floor(Math.random() * 2500);
+
+          await sleep(wait);
+        }
+      }
+    }
+
+    if (safetyPass === 0 && isContentBlockedError(lastError)) {
+      currentText = await rewriteForSafeTTS(currentText);
+      continue;
+    }
+
+    break;
+  }
+
+  throw lastError || new Error("All TTS models failed");
 }
 
 /* =========================
    WAV HELPERS
 ========================= */
 
+function isWav(buffer) {
+  return (
 function isWav(buffer) {
   return (
     buffer.length >= 12 &&
@@ -823,7 +1054,6 @@ function pcmToWav(
   header.writeUInt16LE(1, 20);
   header.writeUInt16LE(channels, 22);
   header.writeUInt32LE(sampleRate, 24);
-
   header.writeUInt32LE(
     byteRate,
     28
@@ -1002,22 +1232,15 @@ async function updateJob(id, fields) {
 ========================= */
 
 async function processTTS(job, chatId) {
-  // Existing paused jobs keep their old 80-word chunking.
-  // New jobs use 180 words to reduce TTS overhead.
   const chunkSize =
-    Number(job.tts_chunk_size) > 0
-      ? Number(job.tts_chunk_size)
-      : (
-          Number(job.tts_total_chunks) > 0
-            ? 80
-            : 180
-        );
+    job.tts_total_chunks > 0 && !job.tts_chunk_size
+      ? 80
+      : 180;
 
-  const chunks =
-    splitIntoChunks(
-      job.script,
-      chunkSize
-    );
+  const chunks = splitIntoChunks(
+    job.script,
+    chunkSize
+  );
 
   if (!chunks.length) {
     throw new Error(
@@ -1028,323 +1251,250 @@ async function processTTS(job, chatId) {
   const targetChat =
     chatId || job.chat_id;
 
-  await updateJob(
-    job.id,
-    {
-      chat_id: targetChat,
-      tts_chunk_size: chunkSize,
-      tts_total_chunks: chunks.length,
-      stage: "tts",
-      progress: 55,
-      status: "running",
-      error: null,
+  const existingRows = await db(
+    `SELECT chunk_index
+     FROM job_audio_chunks
+     WHERE job_id=$1
+       AND status='completed'
+       AND audio_data IS NOT NULL`,
+    [job.id]
+  );
+
+  const existingSet = new Set(
+    existingRows.rows.map((row) =>
+      Number(row.chunk_index)
+    )
+  );
+
+  let completed = existingSet.size;
+
+  await updateJob(job.id, {
+    chat_id: targetChat,
+    tts_total_chunks: chunks.length,
+    tts_chunk_size: chunkSize,
+    tts_completed_chunks: completed,
+    stage: "tts",
+    progress: Math.min(
+      85,
+      55 + Math.floor(
+        (completed / chunks.length) * 30
+      )
+    ),
+    status: "running",
+    error: null,
+  });
+
+  let next = 0;
+  let fatal = null;
+
+  const workers = Array.from(
+    { length: Math.min(3, chunks.length) },
+    async () => {
+      while (true) {
+        if (fatal) return;
+
+        const i = next++;
+
+        if (i >= chunks.length) return;
+        if (existingSet.has(i)) continue;
+
+        try {
+          await updateJob(job.id, {
+            tts_current_chunk: i,
+          });
+
+          const result =
+            await generateTTSWithRetry(
+              chunks[i]
+            );
+
+          await db(
+            `INSERT INTO job_audio_chunks
+              (job_id,chunk_index,audio_data,mime_type,status,model,error)
+             VALUES($1,$2,$3,$4,'completed',$5,NULL)
+             ON CONFLICT(job_id,chunk_index)
+             DO UPDATE SET
+               audio_data=EXCLUDED.audio_data,
+               mime_type=EXCLUDED.mime_type,
+               status='completed',
+               model=EXCLUDED.model,
+               error=NULL,
+               updated_at=NOW()`,
+            [
+              job.id,
+              i,
+              result.buffer,
+              result.mimeType,
+              result.model,
+            ]
+          );
+
+          existingSet.add(i);
+          completed += 1;
+
+          const progress = Math.min(
+            85,
+            55 + Math.floor(
+              (completed / chunks.length) * 30
+            )
+          );
+
+          await updateJob(job.id, {
+            tts_completed_chunks: completed,
+            progress,
+            error: null,
+          });
+
+          if (
+            completed === 1 ||
+            completed === chunks.length ||
+            completed % 3 === 0
+          ) {
+            await sendMessage(
+              targetChat,
+              `🎙️ TTS ${completed}/${chunks.length}\nProgress: ${progress}%`
+            );
+          }
+        } catch (error) {
+          fatal = {
+            index: i,
+            error,
+          };
+
+          await db(
+            `INSERT INTO job_audio_chunks
+              (job_id,chunk_index,status,error)
+             VALUES($1,$2,'failed',$3)
+             ON CONFLICT(job_id,chunk_index)
+             DO UPDATE SET
+               status='failed',
+               error=EXCLUDED.error,
+               updated_at=NOW()`,
+            [
+              job.id,
+              i,
+              error.message,
+            ]
+          );
+
+          return;
+        }
+      }
     }
   );
 
-  for (let i = 0; i < chunks.length; i++) {
-    const existing =
-      await db(
-        `
-        SELECT audio_data,status
-        FROM job_audio_chunks
-        WHERE job_id=$1
-          AND chunk_index=$2
-        `,
-        [job.id, i]
-      );
+  await Promise.all(workers);
 
-    if (
-      existing.rows[0]?.status === "completed" &&
-      existing.rows[0]?.audio_data
-    ) {
-      continue;
-    }
+  if (fatal) {
+    await updateJob(job.id, {
+      status: "paused",
+      stage: "tts",
+      error: fatal.error.message,
+    });
 
-    await updateJob(
-      job.id,
-      {
-        tts_current_chunk: i,
-      }
-    );
+    await sendMessage(
+      targetChat,
+      `⏸️ JOB PAUSED SAFELY
 
-    try {
-      const result =
-        await generateTTSWithRetry(
-          chunks[i]
-        );
-
-      await db(
-        `
-        INSERT INTO job_audio_chunks
-        (
-          job_id,
-          chunk_index,
-          audio_data,
-          mime_type,
-          status,
-          model,
-          error
-        )
-        VALUES
-        (
-          $1,$2,$3,$4,
-          'completed',
-          $5,
-          NULL
-        )
-        ON CONFLICT(job_id,chunk_index)
-        DO UPDATE SET
-          audio_data=EXCLUDED.audio_data,
-          mime_type=EXCLUDED.mime_type,
-          status='completed',
-          model=EXCLUDED.model,
-          error=NULL,
-          updated_at=NOW()
-        `,
-        [
-          job.id,
-          i,
-          result.buffer,
-          result.mimeType,
-          result.model
-        ]
-      );
-
-      const r =
-        await db(
-          `
-          SELECT COUNT(*)::int AS count
-          FROM job_audio_chunks
-          WHERE job_id=$1
-            AND status='completed'
-          `,
-          [job.id]
-        );
-
-      const completed =
-        r.rows[0].count;
-
-      const progress =
-        Math.min(
-          85,
-          55 +
-            Math.floor(
-              completed /
-                chunks.length *
-                30
-            )
-        );
-
-      await updateJob(
-        job.id,
-        {
-          tts_completed_chunks:
-            completed,
-          progress,
-          error: null,
-        }
-      );
-
-      await sendMessage(
-        targetChat,
-        `🎙️ TTS chunk ${completed}/${chunks.length} completed\nProgress: ${progress}%`
-      );
-
-    } catch (error) {
-      await db(
-        `
-        INSERT INTO job_audio_chunks
-        (
-          job_id,
-          chunk_index,
-          status,
-          error
-        )
-        VALUES
-        (
-          $1,$2,'failed',$3
-        )
-        ON CONFLICT(job_id,chunk_index)
-        DO UPDATE SET
-          status='failed',
-          error=EXCLUDED.error,
-          updated_at=NOW()
-        `,
-        [
-          job.id,
-          i,
-          error.message
-        ]
-      );
-
-      await updateJob(
-        job.id,
-        {
-          status: "paused",
-          stage: "tts",
-          error: error.message,
-        }
-      );
-
-      await sendMessage(
-        targetChat,
-        `⏸️ JOB PAUSED SAFELY
-
-TTS chunk ${i + 1}/${chunks.length} failed.
+TTS chunk ${fatal.index + 1}/${chunks.length} failed.
 
 Completed chunks are saved.
 
 Resume with:
 /resume ${job.id}`
-      );
+    );
 
-      return null;
-    }
+    return null;
   }
 
-  const rows =
-    await db(
-      `
-      SELECT audio_data
-      FROM job_audio_chunks
-      WHERE job_id=$1
-        AND status='completed'
-      ORDER BY chunk_index
-      `,
-      [job.id]
-    );
-
-  if (
-    rows.rows.length !==
-    chunks.length
-  ) {
-    throw new Error(
-      "Not all TTS chunks completed"
-    );
-  }
-
-  const audio =
-    concatWavBuffers(
-      rows.rows.map(
-        r => r.audio_data
-      )
-    );
-
-  await updateJob(
-    job.id,
-    {
-      tts_completed_chunks:
-        chunks.length,
-      progress: 85,
-      stage: "tts_complete",
-      error: null,
-    }
+  const rows = await db(
+    `SELECT audio_data
+     FROM job_audio_chunks
+     WHERE job_id=$1
+       AND status='completed'
+     ORDER BY chunk_index`,
+    [job.id]
   );
+
+  if (rows.rows.length !== chunks.length) {
+    throw new Error(
+      `Not all TTS chunks completed (${rows.rows.length}/${chunks.length})`
+    );
+  }
+
+  const audio = concatWavBuffers(
+    rows.rows.map((row) =>
+      row.audio_data
+    )
+  );
+
+  await updateJob(job.id, {
+    tts_completed_chunks: chunks.length,
+    progress: 85,
+    stage: "tts_complete",
+    error: null,
+  });
 
   return {
     audio,
     chunks,
   };
 }
+
 function wavDurationSeconds(wav) {
   const f = getWavFormat(wav);
   const pcm = getWavPcm(wav);
 
-  return (
-    pcm.length /
-    (
-      f.sampleRate *
-      f.channels *
-      (f.bits / 8)
-    )
-  );
+  return pcm.length /
+    (f.sampleRate * f.channels * (f.bits / 8));
 }
 
 function srtTime(seconds) {
-  const ms =
-    Math.max(
-      0,
-      Math.round(seconds * 1000)
-    );
-
-  const h =
-    Math.floor(
-      ms / 3600000
-    );
-
-  const m =
-    Math.floor(
-      (ms % 3600000) / 60000
-    );
-
-  const s =
-    Math.floor(
-      (ms % 60000) / 1000
-    );
-
-  const x =
-    ms % 1000;
-
-  return (
-    `${String(h).padStart(2,"0")}:` +
-    `${String(m).padStart(2,"0")}:` +
-    `${String(s).padStart(2,"0")},` +
-    `${String(x).padStart(3,"0")}`
+  const ms = Math.max(
+    0,
+    Math.round(seconds * 1000)
   );
+
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor(
+    ms % 3600000 / 60000
+  );
+  const s = Math.floor(
+    ms % 60000 / 1000
+  );
+  const x = ms % 1000;
+
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")},${String(x).padStart(3, "0")}`;
 }
 
-function makeSrt(
-  chunks,
-  audioBuffers
-) {
+function makeSrt(chunks, audioBuffers) {
   let t = 0;
   let n = 1;
   const out = [];
 
-  for (
-    let i = 0;
-    i < chunks.length;
-    i++
-  ) {
-    const words =
-      chunks[i]
-        .split(/\s+/);
+  for (let i = 0; i < chunks.length; i++) {
+    const words = chunks[i].split(/\s+/);
+    const dur = wavDurationSeconds(
+      audioBuffers[i]
+    );
 
-    const dur =
-      wavDurationSeconds(
-        audioBuffers[i]
-      );
-
-    for (
-      let p = 0;
-      p < words.length;
-      p += 12
-    ) {
-      const line =
-        words
-          .slice(p, p + 12)
-          .join(" ");
+    for (let p = 0; p < words.length; p += 12) {
+      const line = words
+        .slice(p, p + 12)
+        .join(" ");
 
       const a =
-        t +
-        dur *
-          (p / words.length);
+        t + dur * (p / words.length);
 
       const b =
-        t +
-        dur *
-          (
-            Math.min(
-              p + 12,
-              words.length
-            ) /
-            words.length
-          );
+        t + dur *
+        (Math.min(
+          p + 12,
+          words.length
+        ) / words.length);
 
       out.push(
-        `${n++}\n` +
-        `${srtTime(a)} --> ${srtTime(b)}\n` +
-        `${line}\n`
+        `${n++}\n${srtTime(a)} --> ${srtTime(b)}\n${line}\n`
       );
     }
 
@@ -1354,13 +1504,9 @@ function makeSrt(
   return out.join("\n");
 }
 
-/* =========================
-   FFMPEG
-========================= */
-
 function runFfmpeg(
   args,
-  timeoutMs = 600000
+  timeoutMs = 300000
 ) {
   if (!ffmpegPath) {
     throw new Error(
@@ -1368,128 +1514,72 @@ function runFfmpeg(
     );
   }
 
-  return new Promise(
-    (resolve, reject) => {
-      const c =
-        spawn(
-          ffmpegPath,
-          args,
-          {
-            stdio: [
-              "ignore",
-              "ignore",
-              "pipe"
-            ]
-          }
-        );
+  return new Promise((resolve, reject) => {
+    const c = spawn(
+      ffmpegPath,
+      args,
+      {
+        stdio: [
+          "ignore",
+          "ignore",
+          "pipe",
+        ],
+      }
+    );
 
-      let err = "";
-      let settled = false;
+    let err = "";
 
-      const finish =
-        (fn, value) => {
-          if (settled) return;
-
-          settled = true;
-          clearTimeout(timer);
-
-          fn(value);
-        };
-
-      const timer =
-        setTimeout(
-          () => {
-            c.kill("SIGKILL");
-
-            finish(
-              reject,
-              new Error(
-                "FFMPEG_TIMEOUT"
-              )
-            );
-          },
-          timeoutMs
-        );
-
-      c.stderr.on(
-        "data",
-        d => {
-          err +=
-            d.toString();
-
-          if (
-            err.length > 10000
-          ) {
-            err =
-              err.slice(-10000);
-          }
-        }
+    const timer = setTimeout(() => {
+      c.kill("SIGKILL");
+      reject(
+        new Error("FFMPEG_TIMEOUT")
       );
+    }, timeoutMs);
 
-      c.on(
-        "error",
-        e =>
-          finish(
-            reject,
-            e
+    c.stderr.on("data", (d) => {
+      err += d.toString();
+
+      if (err.length > 10000) {
+        err = err.slice(-10000);
+      }
+    });
+
+    c.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+
+    c.on("close", (code) => {
+      clearTimeout(timer);
+
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(
+          new Error(
+            `FFmpeg failed (${code}): ${err.slice(-2500)}`
           )
-      );
-
-      c.on(
-        "close",
-        code => {
-          if (code === 0) {
-            finish(
-              resolve
-            );
-          } else {
-            finish(
-              reject,
-              new Error(
-                `FFmpeg failed (${code}): ${err.slice(-2500)}`
-              )
-            );
-          }
-        }
-      );
-    }
-  );
+        );
+      }
+    });
+  });
 }
 
-async function getPersistedMedia(
-  jobId
-) {
-  const r =
-    await db(
-      `
-      SELECT
-        kind,
-        data,
-        mime_type
-      FROM job_media
-      WHERE job_id=$1
-        AND kind IN
-        (
-          'video',
-          'thumbnail',
-          'captions'
-        )
-      `,
-      [jobId]
-    );
+async function getPersistedMedia(jobId) {
+  const r = await db(
+    `SELECT kind,data,mime_type
+     FROM job_media
+     WHERE job_id=$1
+       AND kind IN ('video','thumbnail','captions')`,
+    [jobId]
+  );
 
   const m = {};
 
-  for (
-    const x of r.rows
-  ) {
+  for (const x of r.rows) {
     m[x.kind] = {
-      data:
-        Buffer.from(
-          x.data
-        ),
-      mimeType:
-        x.mime_type,
+      data: Buffer.from(x.data),
+      mimeType: x.mime_type,
     };
   }
 
@@ -1502,47 +1592,32 @@ async function saveMedia(
   data,
   mimeType
 ) {
-  const b =
-    Buffer.from(data);
+  const b = Buffer.from(data);
 
-  const sha =
-    crypto
-      .createHash("sha256")
-      .update(b)
-      .digest("hex");
+  const sha = crypto
+    .createHash("sha256")
+    .update(b)
+    .digest("hex");
 
   await db(
-    `
-    INSERT INTO job_media
-    (
-      job_id,
-      kind,
-      data,
-      mime_type,
-      sha256
-    )
-    VALUES
-    ($1,$2,$3,$4,$5)
-    ON CONFLICT(job_id,kind)
-    DO UPDATE SET
-      data=EXCLUDED.data,
-      mime_type=EXCLUDED.mime_type,
-      sha256=EXCLUDED.sha256,
-      updated_at=NOW()
-    `,
+    `INSERT INTO job_media
+      (job_id,kind,data,mime_type,sha256)
+     VALUES($1,$2,$3,$4,$5)
+     ON CONFLICT(job_id,kind)
+     DO UPDATE SET
+       data=EXCLUDED.data,
+       mime_type=EXCLUDED.mime_type,
+       sha256=EXCLUDED.sha256,
+       updated_at=NOW()`,
     [
       jobId,
       kind,
       b,
       mimeType,
-      sha
+      sha,
     ]
   );
 }
-
-/* =========================
-   ULTRA FAST VIDEO
-========================= */
 
 async function buildVideoPackage(
   job,
@@ -1550,9 +1625,7 @@ async function buildVideoPackage(
   chunks
 ) {
   const existing =
-    await getPersistedMedia(
-      job.id
-    );
+    await getPersistedMedia(job.id);
 
   if (
     existing.video &&
@@ -1562,73 +1635,43 @@ async function buildVideoPackage(
     return existing;
   }
 
-  const dir =
-    await fs.mkdtemp(
-      path.join(
-        os.tmpdir(),
-        `yt-${job.id}-`
-      )
-    );
+  const dir = await fs.mkdtemp(
+    path.join(
+      os.tmpdir(),
+      `yt-${job.id}-`
+    )
+  );
 
   const audioPath =
-    path.join(
-      dir,
-      "audio.wav"
-    );
+    path.join(dir, "audio.wav");
 
   const srtPath =
-    path.join(
-      dir,
-      "captions.srt"
-    );
+    path.join(dir, "captions.srt");
 
   const videoPath =
-    path.join(
-      dir,
-      "video.mp4"
-    );
+    path.join(dir, "video.mp4");
 
   const thumbPath =
-    path.join(
-      dir,
-      "thumbnail.jpg"
-    );
+    path.join(dir, "thumbnail.jpg");
 
   try {
-    const rows =
-      await db(
-        `
-        SELECT audio_data
-        FROM job_audio_chunks
-        WHERE job_id=$1
-          AND status='completed'
-        ORDER BY chunk_index
-        `,
-        [job.id]
-      );
+    const rows = await db(
+      `SELECT audio_data
+       FROM job_audio_chunks
+       WHERE job_id=$1
+         AND status='completed'
+       ORDER BY chunk_index`,
+      [job.id]
+    );
 
-    const buffers =
-      rows.rows.map(
-        r =>
-          Buffer.from(
-            r.audio_data
-          )
-      );
+    const buffers = rows.rows.map(
+      (r) => Buffer.from(r.audio_data)
+    );
 
-    if (
-      buffers.length !==
-      chunks.length
-    ) {
-      throw new Error(
-        "Missing TTS audio chunks for video build"
-      );
-    }
-
-    const srt =
-      makeSrt(
-        chunks,
-        buffers
-      );
+    const srt = makeSrt(
+      chunks,
+      buffers
+    );
 
     await fs.writeFile(
       audioPath,
@@ -1640,116 +1683,65 @@ async function buildVideoPackage(
       srt
     );
 
-    const dur =
-      Math.max(
-        1,
-        wavDurationSeconds(
-          audio
-        )
-      );
-
-    // IMPORTANT:
-    // Captions are NOT burned into video.
-    // SRT is delivered separately.
-    // This removes the slow subtitle filter.
-
-    await runFfmpeg(
-      [
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-
-        "-f",
-        "lavfi",
-
-        "-i",
-        "color=c=black:s=640x360:r=10",
-
-        "-i",
-        audioPath,
-
-        "-t",
-        String(dur),
-
-        "-c:v",
-        "libx264",
-
-        "-preset",
-        "ultrafast",
-
-        "-tune",
-        "stillimage",
-
-        "-crf",
-        "38",
-
-        "-pix_fmt",
-        "yuv420p",
-
-        "-threads",
-        "0",
-
-        "-c:a",
-        "aac",
-
-        "-b:a",
-        "48k",
-
-        "-movflags",
-        "+faststart",
-
-        videoPath
-      ],
-      600000
+    const dur = Math.max(
+      1,
+      wavDurationSeconds(audio)
     );
 
+    await runFfmpeg([
+      "-y",
+      "-f",
+      "lavfi",
+      "-i",
+      "color=c=black:s=640x360:r=10",
+      "-i",
+      audioPath,
+      "-t",
+      String(dur),
+      "-c:v",
+      "libx264",
+      "-preset",
+      "ultrafast",
+      "-tune",
+      "stillimage",
+      "-crf",
+      "38",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "64k",
+      videoPath,
+    ]);
+
     const video =
-      await fs.readFile(
-        videoPath
-      );
+      await fs.readFile(videoPath);
 
     if (
-      video.length >
-      49 * 1024 * 1024
+      video.length > 49 * 1024 * 1024
     ) {
       throw new Error(
         `Final video is too large for Telegram: ${(video.length / 1048576).toFixed(1)}MB`
       );
     }
 
-    // Small thumbnail
-    await runFfmpeg(
-      [
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-
-        "-i",
-        videoPath,
-
-        "-frames:v",
-        "1",
-
-        "-q:v",
-        "8",
-
-        thumbPath
-      ],
-      120000
-    );
+    await runFfmpeg([
+      "-y",
+      "-i",
+      videoPath,
+      "-frames:v",
+      "1",
+      "-q:v",
+      "5",
+      thumbPath,
+    ]);
 
     const thumb =
-      await fs.readFile(
-        thumbPath
-      );
+      await fs.readFile(thumbPath);
 
     const cap =
-      Buffer.from(
-        srt,
-        "utf8"
-      );
+      Buffer.from(srt, "utf8");
 
     await saveMedia(
       job.id,
@@ -1775,33 +1767,87 @@ async function buildVideoPackage(
     return {
       video: {
         data: video,
-        mimeType:
-          "video/mp4"
+        mimeType: "video/mp4",
       },
-
       thumbnail: {
         data: thumb,
-        mimeType:
-          "image/jpeg"
+        mimeType: "image/jpeg",
       },
-
       captions: {
         data: cap,
-        mimeType:
-          "application/x-subrip"
-      }
+        mimeType: "application/x-subrip",
+      },
     };
-
   } finally {
     await fs.rm(
       dir,
       {
         recursive: true,
-        force: true
+        force: true,
       }
-    ).catch(
-      () => {}
+    ).catch(() => {});
+  }
+}
+
+const jobQueue = new Map();
+let queuePumpRunning = false;
+
+function processJob(
+  id,
+  chatId = null
+) {
+  if (!jobQueue.has(id)) {
+    jobQueue.set(id, {
+      id,
+      chatId,
+    });
+  }
+
+  pumpJobQueue().catch((error) => {
+    console.error(
+      "Job queue pump failed:",
+      error
     );
+  });
+
+  return Promise.resolve(true);
+}
+
+async function pumpJobQueue() {
+  if (queuePumpRunning) return;
+
+  queuePumpRunning = true;
+
+  try {
+    while (jobQueue.size > 0) {
+      const item =
+        jobQueue.values().next().value;
+
+      jobQueue.delete(item.id);
+
+      try {
+        await runJobOnce(
+          item.id,
+          item.chatId
+        );
+      } catch (error) {
+        console.error(
+          `Unhandled worker error for ${item.id}:`,
+          error
+        );
+      }
+    }
+  } finally {
+    queuePumpRunning = false;
+
+    if (jobQueue.size > 0) {
+      pumpJobQueue().catch((error) => {
+        console.error(
+          "Job queue restart failed:",
+          error
+        );
+      });
+    }
   }
 }
 
@@ -1809,49 +1855,36 @@ async function buildVideoPackage(
    FULL JOB
 ========================= */
 
-async function processJobInternal(
+async function runJobOnce(
   id,
   chatId = null
 ) {
-  const claim =
-    await db(
-      `
-      UPDATE jobs
-      SET
-        status='running',
-        chat_id=COALESCE($2,chat_id),
-        error=NULL,
-        updated_at=NOW()
-      WHERE id=$1
-        AND status='queued'
-      RETURNING *
-      `,
-      [
-        id,
-        chatId
-      ]
-    );
+  const claim = await db(
+    `UPDATE jobs
+     SET status='running',
+         chat_id=COALESCE($2,chat_id),
+         error=NULL,
+         updated_at=NOW()
+     WHERE id=$1
+       AND status='queued'
+     RETURNING *`,
+    [id, chatId]
+  );
 
   if (!claim.rows[0]) {
     return false;
   }
 
-  let job =
-    claim.rows[0];
-
+  let job = claim.rows[0];
   const targetChat =
-    chatId ||
-    job.chat_id;
+    chatId || job.chat_id;
 
   try {
     if (!job.script) {
-      await updateJob(
-        id,
-        {
-          stage: "script",
-          progress: 10
-        }
-      );
+      await updateJob(id, {
+        stage: "script",
+        progress: 10,
+      });
 
       await sendMessage(
         targetChat,
@@ -1859,35 +1892,23 @@ async function processJobInternal(
       );
 
       const r =
-        await generateScript(
-          job.topic
-        );
+        await generateScript(job.topic);
 
       const wc =
-        qualityCheck(
-          r.script
-        );
+        qualityCheck(r.script);
 
-      await updateJob(
-        id,
-        {
-          script: r.script,
-          progress: 50,
-          stage:
-            "quality_checked"
-        }
-      );
+      await updateJob(id, {
+        script: r.script,
+        progress: 50,
+        stage: "quality_checked",
+      });
 
       await sendMessage(
         targetChat,
-        `📝 Script generated — ${r.model}
-
-✅ Quality check passed — ${wc} words
-Progress: 50%`
+        `📝 Script generated — ${r.model}\n\n✅ Quality check passed — ${wc} words\nProgress: 50%`
       );
 
-      job =
-        await getJob(id);
+      job = await getJob(id);
     }
 
     const tts =
@@ -1900,21 +1921,17 @@ Progress: 50%`
       return false;
     }
 
-    job =
-      await getJob(id);
+    job = await getJob(id);
 
-    await updateJob(
-      id,
-      {
-        stage: "video",
-        progress: 88,
-        status: "running"
-      }
-    );
+    await updateJob(id, {
+      stage: "video",
+      progress: 88,
+      status: "running",
+    });
 
     await sendMessage(
       targetChat,
-      "🎬 Building ULTRA-FAST video + thumbnail (SRT separate)\nProgress: 88%"
+      "🎬 Building video + captions + thumbnail\nProgress: 88%"
     );
 
     const media =
@@ -1924,14 +1941,11 @@ Progress: 50%`
         tts.chunks
       );
 
-    await updateJob(
-      id,
-      {
-        stage: "delivery",
-        progress: 95,
-        status: "running"
-      }
-    );
+    await updateJob(id, {
+      stage: "delivery",
+      progress: 95,
+      status: "running",
+    });
 
     await sendMessage(
       targetChat,
@@ -1962,26 +1976,19 @@ Progress: 50%`
       `📝 Captions\nJob: ${id}`
     );
 
-    await updateJob(
-      id,
-      {
-        status: "completed",
-        stage: "completed",
-        progress: 100,
-        error: null
-      }
-    );
+    await updateJob(id, {
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      error: null,
+    });
 
     await sendMessage(
       targetChat,
-      `✅ JOB COMPLETED — 100%
-
-🎬 Video + thumbnail + captions delivered.
-Job: ${id}`
+      `✅ JOB COMPLETED — 100%\n\n🎬 Video + thumbnail + captions delivered.\nJob: ${id}`
     );
 
     return true;
-
   } catch (error) {
     console.error(
       `Job ${id} failed:`,
@@ -1992,11 +1999,9 @@ Job: ${id}`
       id,
       {
         status: "paused",
-        error: error.message
+        error: error.message,
       }
-    ).catch(
-      () => {}
-    );
+    ).catch(() => {});
 
     await sendMessage(
       targetChat,
@@ -2005,266 +2010,123 @@ Job: ${id}`
 Reason: ${error.message}
 
 Completed TTS/media are saved.
-
 Resume with:
 /resume ${id}`
-    ).catch(
-      () => {}
-    );
+    ).catch(() => {});
 
     return false;
   }
-}
-
-const MAX_CONCURRENT_JOBS =
-  Math.max(
-    1,
-    Math.min(
-      2,
-      Number(
-        process.env.MAX_CONCURRENT_JOBS ||
-        1
-      )
-    )
-  );
-
-const activeJobIds =
-  new Set();
-
-const jobQueue = [];
-
-function enqueueJob(
-  id,
-  chatId = null
-) {
-  if (
-    activeJobIds.has(id) ||
-    jobQueue.some(
-      x => x.id === id
-    )
-  ) {
-    return;
-  }
-
-  jobQueue.push({
-    id,
-    chatId
-  });
-
-  drainJobQueue();
-}
-
-async function drainJobQueue() {
-  while (
-    activeJobIds.size <
-      MAX_CONCURRENT_JOBS &&
-    jobQueue.length
-  ) {
-    const item =
-      jobQueue.shift();
-
-    if (
-      activeJobIds.has(
-        item.id
-      )
-    ) {
-      continue;
-    }
-
-    activeJobIds.add(
-      item.id
-    );
-
-    processJobInternal(
-      item.id,
-      item.chatId
-    )
-      .catch(
-        error =>
-          console.error(
-            `Background job ${item.id} error:`,
-            error
-          )
-      )
-      .finally(
-        () => {
-          activeJobIds.delete(
-            item.id
-          );
-
-          drainJobQueue();
-        }
-      );
-  }
-}
-
-function processJob(
-  id,
-  chatId = null
-) {
-  enqueueJob(
-    id,
-    chatId
-  );
-
-  return Promise.resolve(
-    true
-  );
 }
 
 /* =========================
    CREATE
 ========================= */
 
-async function createJob(
-  topic,
-  chatId
-) {
+/* =========================
+   CREATE
+========================= */
+
+async function createJob(topic, chatId) {
   const id =
     `job_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
 
   await db(
     `
     INSERT INTO jobs
-    (
-      id,
-      topic,
-      chat_id,
-      status,
-      progress,
-      stage
-    )
+      (
+        id,
+        topic,
+        chat_id,
+        status,
+        progress,
+        stage
+      )
     VALUES
-    (
-      $1,
-      $2,
-      $3,
-      'queued',
-      0,
-      'queued'
-    )
+      (
+        $1,
+        $2,
+        $3,
+        'queued',
+        0,
+        'queued'
+      )
     `,
     [
       id,
       topic,
-      chatId
+      chatId,
     ]
   );
 
-  await sendMessage(
+  sendMessage(
     chatId,
-    `🎬 JOB CREATED
+    `🎬 JOB CREATED\n\nTopic: ${topic}\n\nJob ID: ${id}`
+  ).catch(() => {});
 
-Topic: ${topic}
-
-Job ID: ${id}`
-  );
-
-  processJob(
+  setImmediate(() => processJob(
     id,
     chatId
-  ).catch(
-    async error => {
-      console.error(
-        "Background job error:",
-        error
-      );
+  ).catch(async (error) => {
+    console.error(
+      "Background job error:",
+      error
+    );
 
-      await updateJob(
-        id,
-        {
-          status: "paused",
-          error:
-            error.message
-        }
-      ).catch(
-        () => {}
-      );
+    await updateJob(
+      id,
+      {
+        status: "paused",
+        error: error.message,
+      }
+    ).catch(() => {});
 
-      await sendMessage(
-        chatId,
-        `⏸️ JOB PAUSED SAFELY
+    await sendMessage(
+      chatId,
+      `⏸️ JOB PAUSED SAFELY
 
 Reason: ${error.message}
 
 Resume with:
 /resume ${id}`
-      ).catch(
-        () => {}
-      );
-    }
-  );
+    ).catch(() => {});
+  });
 
   return id;
-    }
+}
+
 /* =========================
    RESUME
 ========================= */
 
-async function resumeJob(
-  id,
-  chatId
-) {
-  const job =
-    await getJob(id);
+async function resumeJob(id,chatId){
+  const job=await getJob(id);
 
-  if (!job) {
-    await sendMessage(
-      chatId,
-      "❌ Job not found."
-    );
+  if(!job){
+    await sendMessage(chatId,"❌ Job not found.");
     return;
   }
 
-  if (
-    job.chat_id &&
-    String(job.chat_id) !==
-      String(chatId)
-  ) {
-    await sendMessage(
-      chatId,
-      "❌ This job belongs to another chat."
-    );
+  if(job.chat_id&&String(job.chat_id)!==String(chatId)){
+    await sendMessage(chatId,"❌ This job belongs to another chat.");
     return;
   }
 
-  if (
-    job.status ===
-    "completed"
-  ) {
-    await sendMessage(
-      chatId,
-      "✅ This job is already completed."
-    );
+  if(job.status==='completed'){
+    await sendMessage(chatId,"✅ This job is already completed.");
     return;
   }
 
-  if (
-    job.status ===
-    "running"
-  ) {
-    await sendMessage(
-      chatId,
-      "ℹ️ This job is already running."
-    );
+  if(job.status==='running'){
+    await sendMessage(chatId,"ℹ️ This job is already running.");
     return;
   }
 
-  if (
-    job.status ===
-    "queued"
-  ) {
-    await sendMessage(
-      chatId,
-      "ℹ️ This job is already queued."
-    );
+  if(job.status==='queued'){
+    await sendMessage(chatId,"ℹ️ This job is already queued.");
     return;
   }
 
-  if (
-    job.status !==
-    "paused"
-  ) {
+  if(job.status!=='paused'){
     await sendMessage(
       chatId,
       `ℹ️ Cannot resume job from status: ${job.status}`
@@ -2272,26 +2134,22 @@ async function resumeJob(
     return;
   }
 
-  const claim =
-    await db(
-      `
-      UPDATE jobs
-      SET
-        status='queued',
-        chat_id=$2,
-        error=NULL,
-        updated_at=NOW()
-      WHERE id=$1
-        AND status='paused'
-      RETURNING id
-      `,
-      [
-        id,
-        chatId
-      ]
-    );
+  const claim=await db(
+    `
+    UPDATE jobs
+    SET
+      status='queued',
+      chat_id=$2,
+      error=NULL,
+      updated_at=NOW()
+    WHERE id=$1
+      AND status='paused'
+    RETURNING id
+    `,
+    [id,chatId]
+  );
 
-  if (!claim.rows[0]) {
+  if(!claim.rows[0]){
     await sendMessage(
       chatId,
       "ℹ️ Resume already started or job state changed."
@@ -2308,24 +2166,16 @@ ${id}
 Saved script, TTS chunks and media will be reused.`
   );
 
-  processJob(
-    id,
-    chatId
-  ).catch(
-    () => {}
-  );
+  processJob(id,chatId).catch(()=>{});
 }
 
 /* =========================
    STATUS
 ========================= */
 
-async function status(
-  chatId
-) {
+async function status(chatId) {
   const result =
-    await db(
-      `
+    await db(`
       SELECT
         COUNT(*) FILTER (
           WHERE status = 'running'
@@ -2346,8 +2196,8 @@ async function status(
         COUNT(*)::int AS total
 
       FROM jobs
-      `
-    );
+      WHERE chat_id = $1
+    `, [chatId]);
 
   const s =
     result.rows[0];
@@ -2375,37 +2225,30 @@ Payment mode: APPROVAL ONLY`
 app.post(
   "/telegram/webhook",
   async (req, res) => {
+
     try {
-      if (
+
+      if(
         WEBHOOK_SECRET &&
-        req.get(
-          "X-Telegram-Bot-Api-Secret-Token"
-        ) !== WEBHOOK_SECRET
-      ) {
+        req.get("X-Telegram-Bot-Api-Secret-Token") !== WEBHOOK_SECRET
+      ){
         return res.sendStatus(401);
       }
 
-      const updateId =
-        req.body?.update_id;
+      const updateId=req.body?.update_id;
 
-      if (
-        Number.isSafeInteger(
-          updateId
-        )
-      ) {
-        const ins =
-          await db(
-            `
-            INSERT INTO telegram_updates
-            (update_id)
-            VALUES ($1)
-            ON CONFLICT DO NOTHING
-            RETURNING update_id
-            `,
-            [updateId]
-          );
+      if(Number.isSafeInteger(updateId)){
+        const ins=await db(
+          `
+          INSERT INTO telegram_updates(update_id)
+          VALUES($1)
+          ON CONFLICT DO NOTHING
+          RETURNING update_id
+          `,
+          [updateId]
+        );
 
-        if (!ins.rows[0]) {
+        if(!ins.rows[0]){
           return res.sendStatus(200);
         }
       }
@@ -2415,10 +2258,10 @@ app.post(
       const message =
         req.body?.message;
 
-      if (
+      if(
         !message?.chat?.id ||
         !message?.text
-      ) {
+      ){
         return;
       }
 
@@ -2428,9 +2271,12 @@ app.post(
       const text =
         message.text.trim();
 
-      if (
-        text === "/start"
-      ) {
+      /* =====================
+         /start
+      ===================== */
+
+      if (text === "/start") {
+
         await sendMessage(
           chatId,
           `🤖 AI YouTube Autopilot
@@ -2453,9 +2299,12 @@ Example:
         return;
       }
 
-      if (
-        text === "/status"
-      ) {
+      /* =====================
+         /status
+      ===================== */
+
+      if (text === "/status") {
+
         await status(
           chatId
         );
@@ -2463,17 +2312,21 @@ Example:
         return;
       }
 
+      /* =====================
+         /create
+      ===================== */
+
       if (
-        text.startsWith(
-          "/create "
-        )
+        text.startsWith("/create ")
       ) {
+
         const topic =
           text
             .substring(8)
             .trim();
 
         if (!topic) {
+
           await sendMessage(
             chatId,
             "Use: /create <topic>"
@@ -2490,17 +2343,21 @@ Example:
         return;
       }
 
+      /* =====================
+         /resume
+      ===================== */
+
       if (
-        text.startsWith(
-          "/resume "
-        )
+        text.startsWith("/resume ")
       ) {
+
         const id =
           text
             .substring(8)
             .trim();
 
         if (!id) {
+
           await sendMessage(
             chatId,
             "Use: /resume <job_id>"
@@ -2517,6 +2374,10 @@ Example:
         return;
       }
 
+      /* =====================
+         UNKNOWN COMMAND
+      ===================== */
+
       await sendMessage(
         chatId,
         `Unknown command.
@@ -2530,10 +2391,12 @@ Use:
       );
 
     } catch (error) {
+
       console.error(
         "Webhook processing error:",
         error
       );
+
     }
   }
 );
@@ -2545,12 +2408,14 @@ Use:
 app.get(
   "/",
   (req, res) => {
+
     res.json({
       ok: true,
       service:
         "AI YouTube Autopilot",
-      status: "online"
+      status: "online",
     });
+
   }
 );
 
@@ -2559,13 +2424,20 @@ app.get(
 ========================= */
 
 async function startup() {
+
   try {
+
     await initDatabase();
+
+    /* =====================
+       TELEGRAM WEBHOOK
+    ===================== */
 
     if (
       WEBHOOK_URL &&
       TELEGRAM_BOT_TOKEN
     ) {
+
       console.log(
         "Setting Telegram webhook:",
         WEBHOOK_URL
@@ -2574,8 +2446,8 @@ async function startup() {
       const webhookBody = {
         url: WEBHOOK_URL,
         allowed_updates: [
-          "message"
-        ]
+          "message",
+        ],
       };
 
       if (WEBHOOK_SECRET) {
@@ -2593,25 +2465,32 @@ async function startup() {
       );
     }
 
+    /* =====================
+       RECOVERY
+    ===================== */
+
     const recovery =
-      await db(
-        `
+      await db(`
         UPDATE jobs
         SET
-          status='queued',
-          updated_at=NOW()
-        WHERE status='running'
+          status = 'queued',
+          updated_at = NOW()
+        WHERE status = 'running'
         RETURNING id
-        `
-      );
+      `);
 
     console.log(
       `Recovered ${recovery.rows.length} interrupted job(s) to queued state`
     );
 
+    /* =====================
+       SERVER
+    ===================== */
+
     app.listen(
       PORT,
       () => {
+
         console.log(
           `AI YouTube Autopilot listening on port ${PORT}`
         );
@@ -2620,71 +2499,38 @@ async function startup() {
           "STARTUP COMPLETE"
         );
 
-        setTimeout(
-          async () => {
-            try {
-              const queued =
-                await db(
-                  `
-                  SELECT
-                    id,
-                    chat_id
-                  FROM jobs
-                  WHERE status='queued'
-                  ORDER BY created_at ASC
-                  LIMIT 10
-                  `
-                );
+        setTimeout(async () => {
 
-              for (
-                const row of
-                queued.rows
-              ) {
-                processJob(
-                  row.id,
-                  row.chat_id
-                ).catch(
-                  async error => {
-                    await updateJob(
-                      row.id,
-                      {
-                        status:
-                          "paused",
-                        error:
-                          error.message
-                      }
-                    ).catch(
-                      () => {}
-                    );
+          try {
 
-                    await sendMessage(
-                      row.chat_id,
-                      `⏸️ JOB PAUSED SAFELY
+            const queued = await db(`
+              SELECT id, chat_id
+              FROM jobs
+              WHERE status = 'queued'
+              ORDER BY created_at ASC
+              LIMIT 10
+            `);
 
-Reason: ${error.message}
-
-Resume with:
-/resume ${row.id}`
-                    ).catch(
-                      () => {}
-                    );
-                  }
-                );
-              }
-
-            } catch (error) {
-              console.error(
-                "Queued-job recovery failed:",
-                error
-              );
+            for (const row of queued.rows) {
+              processJob(row.id, row.chat_id);
             }
-          },
-          1000
-        );
+
+          } catch (error) {
+
+            console.error(
+              "Queued-job recovery failed:",
+              error
+            );
+
+          }
+
+        }, 1000);
+
       }
     );
 
   } catch (error) {
+
     console.error(
       "STARTUP FAILED:",
       error
@@ -2701,26 +2547,26 @@ Resume with:
 process.on(
   "SIGTERM",
   async () => {
+
     await pool
       .end()
-      .catch(
-        () => {}
-      );
+      .catch(() => {});
 
     process.exit(0);
+
   }
 );
 
 process.on(
   "SIGINT",
   async () => {
+
     await pool
       .end()
-      .catch(
-        () => {}
-      );
+      .catch(() => {});
 
     process.exit(0);
+
   }
 );
 
