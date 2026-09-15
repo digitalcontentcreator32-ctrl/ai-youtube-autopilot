@@ -20,9 +20,7 @@ const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL
-    ? { rejectUnauthorized: false }
-    : false,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
   connectionTimeoutMillis: 15000,
 });
 
@@ -39,145 +37,326 @@ const TTS_MODELS = [
   "gemini-2.5-pro-preview-tts",
 ];
 
-const WORK_DIR = path.join(os.tmpdir(), "ai-youtube-autopilot");
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-await fs.mkdir(WORK_DIR, { recursive: true });
-
-async function db(sql, params = []) {
-  const client = await pool.connect();
-
-  try {
-    return await client.query(sql, params);
-  } finally {
-    client.release();
-  }
+async function db(query, params = []) {
+  return pool.query(query, params);
 }
 
+/* =========================
+   DATABASE
+========================= */
+
 async function initDatabase() {
+  console.log("Starting PostgreSQL database initialization...");
+
   await db(`
     CREATE TABLE IF NOT EXISTS jobs (
-      id BIGSERIAL PRIMARY KEY,
-      chat_id TEXT,
-      topic TEXT,
-      status TEXT DEFAULT 'queued',
+      id TEXT PRIMARY KEY,
+      topic TEXT NOT NULL,
+      chat_id BIGINT,
+      status TEXT NOT NULL DEFAULT 'queued',
+      progress INTEGER NOT NULL DEFAULT 0,
+      stage TEXT DEFAULT 'queued',
       script TEXT,
+      error TEXT,
       tts_total_chunks INTEGER DEFAULT 0,
       tts_completed_chunks INTEGER DEFAULT 0,
-      tts_chunk_size INTEGER DEFAULT 0,
-      video_path TEXT,
-      thumbnail_path TEXT,
-      captions_path TEXT,
-      error TEXT,
+      tts_current_chunk INTEGER DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
 
-  await db(`
-    ALTER TABLE jobs
-    ADD COLUMN IF NOT EXISTS chat_id TEXT
-  `);
+  /* =========================
+     JOBS MIGRATION
+  ========================= */
 
   await db(`
     ALTER TABLE jobs
-    ADD COLUMN IF NOT EXISTS tts_chunk_size INTEGER DEFAULT 0
+    ADD COLUMN IF NOT EXISTS chat_id BIGINT
   `);
 
   await db(`
-    CREATE TABLE IF NOT EXISTS job_media (
-      id BIGSERIAL PRIMARY KEY,
-      job_id BIGINT REFERENCES jobs(id) ON DELETE CASCADE,
-      media_type TEXT,
-      file_path TEXT,
-      sha256 TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    )
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS script TEXT
   `);
 
   await db(`
-    ALTER TABLE job_media
-    ADD COLUMN IF NOT EXISTS sha256 TEXT
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS error TEXT
   `);
 
   await db(`
-    ALTER TABLE job_media
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS stage TEXT DEFAULT 'queued'
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'queued'
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_total_chunks INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_completed_chunks INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_current_chunk INTEGER DEFAULT 0
+  `);
+
+  await db(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tts_chunk_size INTEGER DEFAULT 0`);
+
+  // Create media table BEFORE running migrations against it.
+  await db(`CREATE TABLE IF NOT EXISTS job_media (job_id TEXT NOT NULL, kind TEXT NOT NULL, data BYTEA NOT NULL, mime_type TEXT NOT NULL, sha256 TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (job_id, kind))`);
+  await db(`ALTER TABLE job_media ADD COLUMN IF NOT EXISTS sha256 TEXT`);
+  await db(`ALTER TABLE job_media ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+  await db(`ALTER TABLE job_media ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+  await db(`CREATE TABLE IF NOT EXISTS telegram_updates (update_id BIGINT PRIMARY KEY, received_at TIMESTAMPTZ DEFAULT NOW())`);
+
+  await db(`
+    ALTER TABLE jobs
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
   `);
 
   await db(`
-    ALTER TABLE job_media
+    ALTER TABLE jobs
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
   `);
 
+  /* =========================
+     AUDIO CHUNKS TABLE
+  ========================= */
+
   await db(`
     CREATE TABLE IF NOT EXISTS job_audio_chunks (
-      id BIGSERIAL PRIMARY KEY,
-      job_id BIGINT REFERENCES jobs(id) ON DELETE CASCADE,
+      job_id TEXT NOT NULL,
       chunk_index INTEGER NOT NULL,
-      text TEXT NOT NULL,
-      audio_path TEXT,
+      audio_data BYTEA,
+      mime_type TEXT,
       status TEXT DEFAULT 'pending',
+      model TEXT,
       error TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW(),
-      UNIQUE(job_id, chunk_index)
+      PRIMARY KEY (job_id, chunk_index)
     )
+  `);
+
+  /*
+    IMPORTANT:
+    The table may already exist from an older
+    version of the application.
+
+    Therefore every required column is checked
+    separately below.
+  */
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS job_id TEXT
   `);
 
   await db(`
-    CREATE TABLE IF NOT EXISTS telegram_updates (
-      update_id BIGINT PRIMARY KEY,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS chunk_index INTEGER
   `);
-}
 
-function telegramUrl(method) {
-  return `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
-}
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS audio_data BYTEA
+  `);
 
-async function telegram(method, body) {
-  const response = await fetch(telegramUrl(method), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS mime_type TEXT
+  `);
 
-  const data = await response.json();
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'
+  `);
 
-  if (!response.ok || !data.ok) {
-    throw new Error(
-      `Telegram ${method} failed: ${JSON.stringify(data)}`
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS model TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS error TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  /* =========================
+     DEFAULT VALUES
+  ========================= */
+
+  await db(`
+    UPDATE jobs
+    SET
+      tts_total_chunks =
+        COALESCE(tts_total_chunks, 0),
+      tts_completed_chunks =
+        COALESCE(tts_completed_chunks, 0),
+      tts_current_chunk =
+        COALESCE(tts_current_chunk, 0),
+      progress =
+        COALESCE(progress, 0),
+      stage =
+        COALESCE(stage, 'queued'),
+      status =
+        COALESCE(status, 'queued'),
+      updated_at =
+        COALESCE(updated_at, NOW())
+  `);
+
+  await db(`
+    UPDATE job_audio_chunks
+    SET
+      status =
+        COALESCE(status, 'pending'),
+      created_at =
+        COALESCE(created_at, NOW()),
+      updated_at =
+        COALESCE(updated_at, NOW())
+  `);
+
+  /* =========================
+     FINAL SCHEMA VERIFICATION
+  ========================= */
+
+  const check = await db(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'job_audio_chunks'
+    ORDER BY ordinal_position
+  `);
+
+  const columns =
+    check.rows.map(
+      row => row.column_name
     );
+
+  const required = [
+    "job_id",
+    "chunk_index",
+    "audio_data",
+    "mime_type",
+    "status",
+    "model",
+    "error",
+    "created_at",
+    "updated_at"
+  ];
+
+  const missing =
+    required.filter(
+      column =>
+        !columns.includes(column)
+    );
+
+  if (missing.length > 0) {
+    throw new Error(
+      `DATABASE MIGRATION FAILED. Missing job_audio_chunks columns: ${missing.join(", ")}`
+    );
+  }
+
+  console.log(
+    "job_audio_chunks schema verified:",
+    columns.join(", ")
+  );
+
+  console.log(
+    "PostgreSQL database initialized and migrations checked"
+  );
+}
+
+/* =========================
+   TELEGRAM
+========================= */
+
+async function telegram(method, body = {}) {
+  if (!TELEGRAM_BOT_TOKEN) {
+    throw new Error("TELEGRAM_BOT_TOKEN missing");
+  }
+
+  const response = await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    }
+  );
+
+  const raw = await response.text();
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`Telegram invalid response: ${raw}`);
+  }
+
+  if (!data.ok) {
+    throw new Error(`Telegram API error: ${raw}`);
   }
 
   return data.result;
 }
 
 async function sendMessage(chatId, text) {
+  if (!chatId) return;
+
   return telegram("sendMessage", {
     chat_id: chatId,
     text,
+    disable_web_page_preview: true,
   });
 }
 
-async function sendDocument(chatId, filePath, caption = "") {
+async function sendDocument(
+  chatId,
+  buffer,
+  filename,
+  mimeType,
+  caption = ""
+) {
+  if (!chatId) return;
+
   const form = new FormData();
 
-  const fileBuffer = await fs.readFile(filePath);
-
-  form.append(
-    "chat_id",
-    String(chatId)
-  );
+  form.append("chat_id", String(chatId));
 
   form.append(
     "document",
-    new Blob([fileBuffer]),
-    path.basename(filePath)
+    new Blob([buffer], { type: mimeType }),
+    filename
   );
 
   if (caption) {
@@ -185,7 +364,7 @@ async function sendDocument(chatId, filePath, caption = "") {
   }
 
   const response = await fetch(
-    telegramUrl("sendDocument"),
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`,
     {
       method: "POST",
       body: form,
@@ -194,226 +373,420 @@ async function sendDocument(chatId, filePath, caption = "") {
 
   const data = await response.json();
 
-  if (!response.ok || !data.ok) {
+  if (!data.ok) {
     throw new Error(
-      `Telegram sendDocument failed: ${JSON.stringify(data)}`
+      `Telegram document error: ${JSON.stringify(data)}`
     );
   }
 
   return data.result;
 }
 
-async function sendPhoto(chatId, filePath, caption = "") {
-  const form = new FormData();
+/* =========================
+   GEMINI REST
+========================= */
 
-  const fileBuffer = await fs.readFile(filePath);
-
-  form.append(
-    "chat_id",
-    String(chatId)
-  );
-
-  form.append(
-    "photo",
-    new Blob([fileBuffer]),
-    path.basename(filePath)
-  );
-
-  if (caption) {
-    form.append("caption", caption);
+async function geminiRequest(
+  model,
+  body,
+  timeoutMs = 45000
+) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY missing");
   }
 
-  const response = await fetch(
-    telegramUrl("sendPhoto"),
-    {
-      method: "POST",
-      body: form,
+  const controller = new AbortController();
+
+  const timer = setTimeout(
+    () => controller.abort(),
+    timeoutMs
+  );
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      }
+    );
+
+    const raw = await response.text();
+
+    if (!response.ok) {
+      const error = new Error(
+        `Gemini ${response.status}: ${raw}`
+      );
+
+      error.status = response.status;
+
+      throw error;
     }
-  );
 
-  const data = await response.json();
+    return JSON.parse(raw);
+  } catch (error) {
+    if (error.name === "AbortError") {
+      const timeoutError = new Error(
+        `REQUEST_TIMEOUT_${timeoutMs}MS`
+      );
 
-  if (!response.ok || !data.ok) {
-    throw new Error(
-      `Telegram sendPhoto failed: ${JSON.stringify(data)}`
-    );
+      timeoutError.code = "TIMEOUT";
+
+      throw timeoutError;
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-
-  return data.result;
 }
 
-async function geminiRequest(model, input, extra = {}) {
-  const response = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/interactions",
-    {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
-      },
-      body: JSON.stringify({
+async function retryGemini(
+  model,
+  body,
+  timeoutMs = 45000,
+  maxAttempts = 2
+) {
+  let lastError;
+
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
+  ) {
+    try {
+      return await geminiRequest(
         model,
-        input,
-        ...extra,
-      }),
+        body,
+        timeoutMs
+      );
+    } catch (error) {
+      lastError = error;
+
+      const retryable =
+        error.code === "TIMEOUT" ||
+        error.status === 429 ||
+        error.status === 500 ||
+        error.status === 502 ||
+        error.status === 503;
+
+      if (!retryable || attempt === maxAttempts) {
+        throw error;
+      }
+
+      const wait =
+        3000 + Math.floor(Math.random() * 4000);
+
+      console.log(
+        `Gemini retry in ${wait}ms after: ${error.message}`
+      );
+
+      await sleep(wait);
     }
-  );
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      `Gemini ${response.status}: ${
-        data?.error?.message ||
-        JSON.stringify(data)
-      }`
-    );
   }
 
-  return data;
+  throw lastError;
 }
 
-function extractTextFromGemini(data) {
-  if (typeof data?.output_text === "string") {
-    return data.output_text;
-  }
-
-  if (typeof data?.text === "string") {
-    return data.text;
-  }
-
-  const outputs = Array.isArray(data?.outputs)
-    ? data.outputs
-    : [];
-
-  for (const output of outputs) {
-    if (typeof output?.text === "string") {
-      return output.text;
-    }
-
-    const content = Array.isArray(output?.content)
-      ? output.content
-      : [];
-
-    for (const item of content) {
-      if (typeof item?.text === "string") {
-        return item.text;
-      }
-    }
-  }
-
-  const steps = Array.isArray(data?.steps)
-    ? data.steps
-    : [];
-
-  for (const step of steps) {
-    const content = Array.isArray(step?.content)
-      ? step.content
-      : [];
-
-    for (const item of content) {
-      if (typeof item?.text === "string") {
-        return item.text;
-      }
-    }
-  }
-
-  return "";
-}
+/* =========================
+   SCRIPT
+========================= */
 
 async function generateScript(topic) {
   const prompt = `
-Create a YouTube narration script about:
+Create an original YouTube narration script about:
 
 ${topic}
 
 Requirements:
-- General audience
-- Interesting and engaging
-- Factually careful
-- Natural voice-over style
-- No headings inside the narration
-- No markdown
-- No stage directions
-- Around 600-800 words
-- Start with a strong hook
-- End naturally
-
-Return ONLY the narration script.
+- Completely original wording.
+- Strong opening hook.
+- Clear factual explanations.
+- No copied article wording.
+- No fake citations.
+- Suitable for a faceless YouTube video.
+- Around 600-800 words.
+- Natural spoken narration.
+- No stage directions.
 `;
 
-  let lastError = null;
+  let lastError;
 
   for (const model of SCRIPT_MODELS) {
     try {
-      const data = await geminiRequest(
+      const result = await retryGemini(
         model,
-        prompt
+        {
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: prompt }],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.8,
+            maxOutputTokens: 3000,
+          },
+        },
+        45000,
+        2
       );
 
-      const text =
-        extractTextFromGemini(data).trim();
+      const text = result?.candidates?.[0]?.content?.parts
+        ?.map((part) => part.text || "")
+        .join("")
+        .trim();
 
       if (text) {
         return {
+          script: text,
           model,
-          text,
         };
       }
     } catch (error) {
+      console.log(
+        `Script model failed: ${model}: ${error.message}`
+      );
+
       lastError = error;
     }
   }
 
   throw lastError ||
-    new Error("Script generation failed");
+    new Error("All script models failed");
 }
 
-function wordCount(text) {
-  return String(text)
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .length;
-}
+/* =========================
+   QUALITY CHECK
+========================= */
 
 function qualityCheck(script) {
-  const count = wordCount(script);
-
-  if (count < 150) {
-    throw new Error(
-      `Generated script is too short: ${count} words`
-    );
-  }
-
-  return count;
-}
-
-function splitIntoChunks(text, maxWords = 180) {
-  const words = String(text)
+  const words = script
     .trim()
     .split(/\s+/)
     .filter(Boolean);
 
-  const chunks = [];
-
-  for (
-    let i = 0;
-    i < words.length;
-    i += maxWords
-  ) {
-    chunks.push(
-      words.slice(i, i + maxWords).join(" ")
+  if (words.length < 150) {
+    throw new Error(
+      "Script too short for quality gate"
     );
+  }
+
+  return words.length;
+}
+
+/* =========================
+   TTS CHUNKING
+========================= */
+
+function splitIntoChunks(
+  text,
+  maxWords = 180
+) {
+  const clean = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!clean) return [];
+
+  const sentences =
+    clean.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ||
+    [clean];
+
+  const chunks = [];
+  let current = [];
+
+  for (const sentence of sentences) {
+    const words = sentence
+      .trim()
+      .split(/\s+/);
+
+    if (words.length > maxWords) {
+      if (current.length) {
+        chunks.push(current.join(" "));
+        current = [];
+      }
+
+      for (
+        let i = 0;
+        i < words.length;
+        i += maxWords
+      ) {
+        chunks.push(
+          words
+            .slice(i, i + maxWords)
+            .join(" ")
+        );
+      }
+
+      continue;
+    }
+
+    if (
+      current.length > 0 &&
+      current.length + words.length > maxWords
+    ) {
+      chunks.push(current.join(" "));
+      current = [];
+    }
+
+    current.push(...words);
+  }
+
+  if (current.length) {
+    chunks.push(current.join(" "));
   }
 
   return chunks;
 }
 
+/* =========================
+   TTS
+========================= */
+
+async function generateTTSChunk(text, model) {
+  const controller = new AbortController();
+  const timeoutMs = 120000;
+
+  const timer = setTimeout(
+    () => controller.abort(),
+    timeoutMs
+  );
+
+  try {
+    const response = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/interactions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          model,
+          input: text,
+          response_format: {
+            type: "audio",
+          },
+          generation_config: {
+            speech_config: [
+              {
+                voice: "Kore",
+                language: /[\u0900-\u097F]/.test(String(text)) ? "hi-IN" : "en-US",
+              },
+            ],
+          },
+        }),
+        signal: controller.signal,
+      }
+    );
+
+    const raw = await response.text();
+
+    if (!response.ok) {
+      const error = new Error(
+        `TTS ${response.status}: ${raw}`
+      );
+
+      error.status = response.status;
+
+      throw error;
+    }
+
+    const result = JSON.parse(raw);
+
+    // IMPORTANT: Current Interactions REST responses put model output
+    // inside `steps[].content[]`. `output_audio` is SDK-only, and `outputs[]`
+    // belongs to older/other response shapes. Support both so the pipeline
+    // remains robust across API revisions.
+    const stepContent = Array.isArray(result?.steps)
+      ? result.steps.flatMap((step) =>
+          Array.isArray(step?.content) ? step.content : []
+        )
+      : [];
+
+    const outputContent = Array.isArray(result?.outputs)
+      ? result.outputs
+      : [];
+
+    const audioOutput =
+      stepContent.find((item) => item?.type === "audio") ||
+      outputContent.find((item) => item?.type === "audio") ||
+      (result?.output_audio?.type === "audio"
+        ? result.output_audio
+        : null);
+
+    const audioData = audioOutput?.data;
+
+    if (!audioData) {
+      const stepTypes = stepContent
+        .map((item) => item?.type)
+        .filter(Boolean);
+
+      throw new Error(
+        `TTS returned no audio data. status=${result?.status || "unknown"}; step_types=${stepTypes.join(",") || "none"}; keys=${Object.keys(result || {}).join(",")}`
+      );
+    }
+
+    const rawBuffer = Buffer.from(audioData, "base64");
+
+    const mimeType =
+      String(audioOutput?.mime_type || "audio/wav")
+        .split(";")[0]
+        .trim()
+        .toLowerCase();
+
+    const parsedRate =
+      String(audioOutput?.mime_type || "")
+        .match(/(?:rate|sample[_-]?rate)\s*=\s*(\d+)/i);
+
+    const sampleRate =
+      audioOutput?.sample_rate ||
+      (parsedRate ? Number(parsedRate[1]) : 24000);
+
+    // WAV is the requested/default format. If the API ever returns raw
+    // 16-bit PCM/L16, wrap it in a WAV container before storing it.
+    const buffer = isWav(rawBuffer)
+      ? rawBuffer
+      : mimeType === "audio/l16"
+        ? pcmToWav(rawBuffer, sampleRate, 1, 16)
+        : rawBuffer;
+
+    if (!isWav(buffer)) {
+      throw new Error(
+        `TTS returned unsupported audio format: ${mimeType}`
+      );
+    }
+
+    return {
+      buffer,
+      mimeType: "audio/wav",
+      sampleRate,
+    };
+  } catch (error) {
+    if (error.name === "AbortError") {
+      const e = new Error(
+        `TTS_REQUEST_TIMEOUT_${timeoutMs}MS`
+      );
+
+      e.code = "TIMEOUT";
+
+      throw e;
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function isContentBlockedError(error) {
-  const text = String(
-    error?.message || ""
-  ).toLowerCase();
+  const text = String(error?.message || "").toLowerCase();
 
   return (
     text.includes("content_blocked") ||
@@ -425,8 +798,8 @@ function isContentBlockedError(error) {
 async function rewriteForSafeTTS(text) {
   const prompt = `
 Rewrite the following narration for a general-audience educational YouTube voice-over.
-
-Keep the factual meaning and topic, but use calm, neutral, non-graphic wording.
+Keep the factual meaning and topic.
+Use calm, neutral, non-graphic wording.
 Remove or replace sensitive or potentially policy-triggering details.
 Do not add new facts.
 Return ONLY the rewritten narration.
@@ -435,1223 +808,550 @@ TEXT:
 ${text}
 `;
 
-  let lastError = null;
+  let lastError;
 
-  for (const model of SCRIPT_MODELS) {
+  for (const model of SCRIPT_MODELS.slice(0, 2)) {
     try {
-      const data = await geminiRequest(
+      const result = await retryGemini(
         model,
-        prompt
-      );
-
-      const rewritten =
-        extractTextFromGemini(data).trim();
-
-      if (rewritten) {
-        return rewritten;
-      }
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError ||
-    new Error("Safe TTS rewrite failed");
-}
-
-async function generateTTS(text) {
-  let lastError = null;
-
-  for (const model of TTS_MODELS) {
-    try {
-      const data = await geminiRequest(
-        model,
-        text,
         {
-          response_format: {
-            type: "audio",
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: prompt }],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 1200,
           },
-          generation_config: {
-            speech_config: [
-              {
-                voice: "Kore",
-                language:
-                  /[\u0900-\u097F]/.test(
-                    String(text)
-                  )
-                    ? "hi-IN"
-                    : "en-US",
-              },
-            ],
-          },
-        }
+        },
+        30000,
+        2
       );
 
-      return data;
+      const rewritten = result?.candidates?.[0]?.content?.parts
+        ?.map((part) => part.text || "")
+        .join("")
+        .trim();
+
+      if (rewritten) return rewritten;
     } catch (error) {
       lastError = error;
+      console.log(`Safe TTS rewrite failed: ${error.message}`);
     }
   }
 
-  throw lastError ||
-    new Error("TTS generation failed");
+  throw lastError || new Error("Safe TTS rewrite failed");
 }
-function getAudioFromGemini(data) {
-  const outputs = Array.isArray(data?.outputs)
-    ? data.outputs
-    : [];
 
-  for (const output of outputs) {
-    if (output?.audio?.data) {
-      return {
-        data: output.audio.data,
-        mimeType:
-          output.audio.mime_type ||
-          output.audio.mimeType ||
-          "audio/wav",
-        sampleRate:
-          output.audio.sample_rate ||
-          output.audio.sampleRate ||
-          24000,
-      };
-    }
+async function generateTTSWithRetry(text) {
+  let lastError;
+  let currentText = String(text || "").trim();
 
-    if (output?.content) {
-      const content = Array.isArray(output.content)
-        ? output.content
-        : [output.content];
+  if (!currentText) {
+    throw new Error("Empty TTS chunk");
+  }
 
-      for (const item of content) {
-        if (item?.audio?.data) {
+  for (let safetyPass = 0; safetyPass < 2; safetyPass++) {
+    for (const model of TTS_MODELS) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
           return {
-            data: item.audio.data,
-            mimeType:
-              item.audio.mime_type ||
-              item.audio.mimeType ||
-              "audio/wav",
-            sampleRate:
-              item.audio.sample_rate ||
-              item.audio.sampleRate ||
-              24000,
+            ...(await generateTTSChunk(currentText, model)),
+            model,
+            textUsed: currentText,
           };
+        } catch (error) {
+          lastError = error;
+
+          if (isContentBlockedError(error)) {
+            console.log(
+              `TTS content blocked model=${model} pass=${safetyPass + 1}`
+            );
+            break;
+          }
+
+          const retryable =
+            error.code === "TIMEOUT" ||
+            [429, 500, 502, 503].includes(error.status);
+
+          console.log(
+            `TTS failed model=${model} attempt=${attempt} status=${error.status || "none"}: ${error.message}`
+          );
+
+          if (!retryable || attempt === 3) {
+            break;
+          }
+
+          const wait =
+            error.status === 429
+              ? 5000 * attempt
+              : 2000 + Math.floor(Math.random() * 2500);
+
+          await sleep(wait);
         }
       }
     }
-  }
 
-  if (data?.output_audio?.data) {
-    return {
-      data: data.output_audio.data,
-      mimeType:
-        data.output_audio.mime_type ||
-        data.output_audio.mimeType ||
-        "audio/wav",
-      sampleRate:
-        data.output_audio.sample_rate ||
-        data.output_audio.sampleRate ||
-        24000,
-    };
-  }
+    if (safetyPass === 0 && isContentBlockedError(lastError)) {
+      currentText = await rewriteForSafeTTS(currentText);
+      continue;
+    }
 
-  return null;
+    break;
 }
+  throw lastError || new Error("All TTS models failed");
+}
+
+/* =========================
+   WAV HELPERS
+========================= */
 
 function isWav(buffer) {
   return (
-    Buffer.isBuffer(buffer) &&
     buffer.length >= 12 &&
-    buffer.subarray(0, 4).toString() === "RIFF" &&
-    buffer.subarray(8, 12).toString() === "WAVE"
+    buffer.toString("ascii", 0, 4) === "RIFF" &&
+    buffer.toString("ascii", 8, 12) === "WAVE"
   );
 }
 
 function pcmToWav(
-  pcmBuffer,
+  pcm,
   sampleRate = 24000,
   channels = 1,
-  bitsPerSample = 16
+  bits = 16
 ) {
   const blockAlign =
-    channels * (bitsPerSample / 8);
+    (channels * bits) / 8;
 
   const byteRate =
     sampleRate * blockAlign;
 
-  const wav = Buffer.alloc(
-    44 + pcmBuffer.length
-  );
+  const header = Buffer.alloc(44);
 
-  wav.write("RIFF", 0);
-  wav.writeUInt32LE(
-    36 + pcmBuffer.length,
+  header.write("RIFF", 0);
+  header.writeUInt32LE(
+    36 + pcm.length,
     4
   );
-  wav.write("WAVE", 8);
 
-  wav.write("fmt ", 12);
-  wav.writeUInt32LE(16, 16);
-  wav.writeUInt16LE(1, 20);
-  wav.writeUInt16LE(channels, 22);
-  wav.writeUInt32LE(sampleRate, 24);
-  wav.writeUInt32LE(byteRate, 28);
-  wav.writeUInt16LE(blockAlign, 32);
-  wav.writeUInt16LE(bitsPerSample, 34);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
 
-  wav.write("data", 36);
-  wav.writeUInt32LE(
-    pcmBuffer.length,
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(
+    byteRate,
+    28
+  );
+
+  header.writeUInt16LE(
+    blockAlign,
+    32
+  );
+
+  header.writeUInt16LE(
+    bits,
+    34
+  );
+
+  header.write("data", 36);
+
+  header.writeUInt32LE(
+    pcm.length,
     40
   );
 
-  pcmBuffer.copy(wav, 44);
-
-  return wav;
+  return Buffer.concat([
+    header,
+    pcm,
+  ]);
 }
 
-function decodeBase64Audio(base64) {
-  if (!base64) {
-    throw new Error(
-      "Gemini TTS returned empty audio data"
-    );
+function getWavPcm(wav) {
+  if (!isWav(wav)) {
+    return wav;
   }
 
-  return Buffer.from(base64, "base64");
-}
+  let offset = 12;
 
-async function saveTTSChunkAudio(
-  jobId,
-  chunkIndex,
-  audioBuffer
-) {
-  const jobDir = path.join(
-    WORK_DIR,
-    `job-${jobId}`
-  );
+  while (offset + 8 <= wav.length) {
+    const id = wav.toString(
+      "ascii",
+      offset,
+      offset + 4
+    );
 
-  await fs.mkdir(jobDir, {
-    recursive: true,
-  });
+    const size = wav.readUInt32LE(
+      offset + 4
+    );
 
-  const audioPath = path.join(
-    jobDir,
-    `chunk-${chunkIndex}.wav`
-  );
-
-  await fs.writeFile(
-    audioPath,
-    audioBuffer
-  );
-
-  return audioPath;
-}
-
-async function synthesizeChunk(text) {
-  let data;
-
-  try {
-    data = await generateTTS(text);
-  } catch (error) {
-    if (isContentBlockedError(error)) {
-      const safeText =
-        await rewriteForSafeTTS(text);
-
-      data = await generateTTS(
-        safeText
+    if (id === "data") {
+      const end = Math.min(
+        offset + 8 + size,
+        wav.length
       );
-    } else {
-      throw error;
+
+      return wav.subarray(
+        offset + 8,
+        end
+      );
     }
+
+    offset += 8 + size;
   }
 
-  const audio = getAudioFromGemini(data);
-
-  if (!audio) {
-    throw new Error(
-      "Gemini TTS response contained no audio"
-    );
-  }
-
-  const rawBuffer =
-    decodeBase64Audio(audio.data);
-
-  const normalizedMimeType =
-    String(audio.mimeType)
-      .split(";")[0]
-      .trim()
-      .toLowerCase();
-
-  const parsedRate =
-    String(audio.mimeType).match(
-      /(?:rate|sample[_-]?rate)\s*=\s*(\d+)/i
-    );
-
-  const sampleRate =
-    audio.sampleRate ||
-    (parsedRate
-      ? Number(parsedRate[1])
-      : 24000);
-
-  const buffer = isWav(rawBuffer)
-    ? rawBuffer
-    : normalizedMimeType === "audio/l16"
-      ? pcmToWav(
-          rawBuffer,
-          sampleRate,
-          1,
-          16
-        )
-      : rawBuffer;
-
-  if (!isWav(buffer)) {
-    throw new Error(
-      `Unsupported TTS audio format: ${normalizedMimeType}`
-    );
-  }
-
-  return buffer;
-}
-
-function sleep(ms) {
-  return new Promise(
-    resolve => setTimeout(resolve, ms)
+  throw new Error(
+    "WAV data chunk not found"
   );
 }
 
-async function synthesizeChunkWithRetry(
-  text,
-  attempts = 3
-) {
-  let lastError = null;
-
-  for (
-    let attempt = 1;
-    attempt <= attempts;
-    attempt++
+function getWavFormat(wav) {
+  if (
+    !isWav(wav) ||
+    wav.length < 36
   ) {
-    try {
-      return await synthesizeChunk(text);
-    } catch (error) {
-      lastError = error;
-
-      if (isContentBlockedError(error)) {
-        throw error;
-      }
-
-      if (attempt < attempts) {
-        await sleep(
-          800 * attempt
-        );
-      }
-    }
+    return {
+      sampleRate: 24000,
+      channels: 1,
+      bits: 16,
+    };
   }
 
-  throw lastError ||
-    new Error("TTS retry failed");
+  return {
+    sampleRate: wav.readUInt32LE(24),
+    channels: wav.readUInt16LE(22),
+    bits: wav.readUInt16LE(34),
+  };
 }
 
-async function getJob(jobId) {
+function concatWavBuffers(buffers) {
+  if (!buffers.length) {
+    throw new Error(
+      "No audio buffers to concatenate"
+    );
+  }
+
+  const first = isWav(buffers[0])
+    ? buffers[0]
+    : pcmToWav(buffers[0]);
+
+  const format = getWavFormat(first);
+
+  const pcm = Buffer.concat(
+    buffers.map(getWavPcm)
+  );
+
+  return pcmToWav(
+    pcm,
+    format.sampleRate,
+    format.channels,
+    format.bits
+  );
+}
+
+/* =========================
+   JOB HELPERS
+========================= */
+
+async function getJob(id) {
   const result = await db(
-    `
-      SELECT *
-      FROM jobs
-      WHERE id = $1
-      LIMIT 1
-    `,
-    [jobId]
+    `SELECT * FROM jobs WHERE id = $1`,
+    [id]
   );
 
   return result.rows[0] || null;
 }
 
-async function updateJob(
-  jobId,
-  fields
-) {
+async function updateJob(id, fields) {
   const entries =
     Object.entries(fields);
 
-  if (!entries.length) {
-    return getJob(jobId);
-  }
+  if (!entries.length) return;
+
+  const allowed = new Set([
+    "topic",
+    "chat_id",
+    "status",
+    "progress",
+    "stage",
+    "script",
+    "error",
+    "tts_total_chunks",
+    "tts_completed_chunks",
+    "tts_current_chunk",
+    "tts_chunk_size",
+  ]);
 
   const values = [];
   const sets = [];
 
-  let index = 1;
-
   for (const [key, value] of entries) {
-    sets.push(
-      `"${key}" = $${index}`
-    );
+    if (!allowed.has(key)) {
+      throw new Error(
+        `Invalid job field: ${key}`
+      );
+    }
+
     values.push(value);
-    index++;
+
+    sets.push(
+      `${key} = $${values.length}`
+    );
   }
 
-  values.push(jobId);
+  values.push(id);
 
-  const result = await db(
+  await db(
     `
-      UPDATE jobs
-      SET ${sets.join(", ")},
-          updated_at = NOW()
-      WHERE id = $${index}
-      RETURNING *
+    UPDATE jobs
+    SET ${sets.join(", ")},
+        updated_at = NOW()
+    WHERE id = $${values.length}
     `,
     values
   );
-
-  return result.rows[0] || null;
 }
 
-async function claimJob(jobId) {
-  const result = await db(
-    `
-      UPDATE jobs
-      SET status = 'processing',
-          updated_at = NOW()
-      WHERE id = $1
-        AND status IN (
-          'queued',
-          'paused',
-          'processing'
-        )
-      RETURNING *
-    `,
-    [jobId]
-  );
+/* =========================
+   TTS JOB PROCESSOR
+========================= */
 
-  return result.rows[0] || null;
-}
-
-async function getLatestJobForChat(
-  chatId
-) {
-  const result = await db(
-    `
-      SELECT *
-      FROM jobs
-      WHERE chat_id = $1
-      ORDER BY id DESC
-      LIMIT 1
-    `,
-    [String(chatId)]
-  );
-
-  return result.rows[0] || null;
-}
-
-async function getPausedJobForChat(
-  chatId,
-  jobId = null
-) {
-  if (jobId) {
-    const result = await db(
-      `
-        SELECT *
-        FROM jobs
-        WHERE id = $1
-          AND chat_id = $2
-          AND status = 'paused'
-        LIMIT 1
-      `,
-      [
-        jobId,
-        String(chatId),
-      ]
-    );
-
-    return result.rows[0] || null;
-  }
-
-  const result = await db(
-    `
-      SELECT *
-      FROM jobs
-      WHERE chat_id = $1
-        AND status = 'paused'
-      ORDER BY id DESC
-      LIMIT 1
-    `,
-    [String(chatId)]
-  );
-
-  return result.rows[0] || null;
-}
-
-async function getAudioChunks(
-  jobId
-) {
-  const result = await db(
-    `
-      SELECT *
-      FROM job_audio_chunks
-      WHERE job_id = $1
-      ORDER BY chunk_index ASC
-    `,
-    [jobId]
-  );
-
-  return result.rows;
-}
-
-async function getAudioChunk(
-  jobId,
-  chunkIndex
-) {
-  const result = await db(
-    `
-      SELECT *
-      FROM job_audio_chunks
-      WHERE job_id = $1
-        AND chunk_index = $2
-      LIMIT 1
-    `,
-    [jobId, chunkIndex]
-  );
-
-  return result.rows[0] || null;
-}
-
-async function upsertAudioChunk(
-  jobId,
-  chunkIndex,
-  text,
-  audioPath,
-  status,
-  error = null
-) {
-  await db(
-    `
-      INSERT INTO job_audio_chunks (
-        job_id,
-        chunk_index,
-        text,
-        audio_path,
-        status,
-        error,
-        updated_at
-      )
-      VALUES (
-        $1,
-        $2,
-        $3,
-        $4,
-        $5,
-        $6,
-        NOW()
-      )
-      ON CONFLICT (
-        job_id,
-        chunk_index
-      )
-      DO UPDATE SET
-        text = EXCLUDED.text,
-        audio_path = EXCLUDED.audio_path,
-        status = EXCLUDED.status,
-        error = EXCLUDED.error,
-        updated_at = NOW()
-    `,
-    [
-      jobId,
-      chunkIndex,
-      text,
-      audioPath,
-      status,
-      error,
-    ]
-  );
-    }
-async function processTTSJob(jobId, chatId) {
-  const job = await getJob(jobId);
-
-  if (!job) {
-    throw new Error(`Job ${jobId} not found`);
-  }
-
-  if (!job.script) {
-    throw new Error("Job has no generated script");
-  }
-
+async function processTTS(job, chatId) {
   const chunkSize =
-    job.tts_total_chunks > 0 &&
-    !job.tts_chunk_size
+    job.tts_total_chunks > 0 && !job.tts_chunk_size
       ? 80
       : 180;
 
-  const chunks = splitIntoChunks(
-    job.script,
-    chunkSize
+  const chunks = splitIntoChunks(job.script, chunkSize);
+
+  if (!chunks.length) {
+    throw new Error("No script text available for TTS");
+  }
+
+  const targetChat = chatId || job.chat_id;
+
+  const existingRows = await db(
+    `SELECT chunk_index
+     FROM job_audio_chunks
+     WHERE job_id=$1
+       AND status='completed'
+       AND audio_data IS NOT NULL`,
+    [job.id]
   );
 
-  await updateJob(jobId, {
+  const existingSet = new Set(
+    existingRows.rows.map((row) => Number(row.chunk_index))
+  );
+
+  let completed = existingSet.size;
+
+  await updateJob(job.id, {
+    chat_id: targetChat,
     tts_total_chunks: chunks.length,
     tts_chunk_size: chunkSize,
-    status: "processing",
+    tts_completed_chunks: completed,
+    stage: "tts",
+    progress: Math.min(
+      85,
+      55 + Math.floor((completed / chunks.length) * 30)
+    ),
+    status: "running",
     error: null,
   });
 
-  let completed = 0;
+  let next = 0;
+  let fatal = null;
 
-  const existing =
-    await getAudioChunks(jobId);
+  const workers = Array.from(
+    { length: Math.min(3, chunks.length) },
+    async () => {
+      while (true) {
+        if (fatal) return;
 
-  for (const item of existing) {
-    if (
-      item.status === "completed" &&
-      item.audio_path
-    ) {
-      try {
-        await fs.access(item.audio_path);
-        completed++;
-      } catch {
-        await upsertAudioChunk(
-          jobId,
-          item.chunk_index,
-          item.text,
-          null,
-          "pending",
-          null
-        );
-      }
-    }
-  }
+        const i = next++;
 
-  await updateJob(jobId, {
-    tts_completed_chunks: completed,
-  });
+        if (i >= chunks.length) return;
+        if (existingSet.has(i)) continue;
 
-  const pendingIndexes = [];
+        try {
+          await updateJob(job.id, {
+            tts_current_chunk: i,
+          });
 
-  for (
-    let i = 0;
-    i < chunks.length;
-    i++
-  ) {
-    const existingChunk =
-      await getAudioChunk(jobId, i);
+          const result = await generateTTSWithRetry(chunks[i]);
 
-    if (
-      existingChunk?.status === "completed" &&
-      existingChunk.audio_path
-    ) {
-      try {
-        await fs.access(
-          existingChunk.audio_path
-        );
-        continue;
-      } catch {
-        // Recreate missing audio.
-      }
-    }
-
-    pendingIndexes.push(i);
-  }
-
-  let cursor = 0;
-
-  async function worker() {
-    while (true) {
-      const position = cursor++;
-
-      if (
-        position >=
-        pendingIndexes.length
-      ) {
-        return;
-      }
-
-      const chunkIndex =
-        pendingIndexes[position];
-
-      const text = chunks[chunkIndex];
-
-      try {
-        const audioBuffer =
-          await synthesizeChunkWithRetry(
-            text
+          await db(
+            `INSERT INTO job_audio_chunks
+              (job_id,chunk_index,audio_data,mime_type,status,model,error)
+             VALUES($1,$2,$3,$4,'completed',$5,NULL)
+             ON CONFLICT(job_id,chunk_index)
+             DO UPDATE SET
+               audio_data=EXCLUDED.audio_data,
+               mime_type=EXCLUDED.mime_type,
+               status='completed',
+               model=EXCLUDED.model,
+               error=NULL,
+               updated_at=NOW()`,
+            [
+              job.id,
+              i,
+              result.buffer,
+              result.mimeType,
+              result.model,
+            ]
           );
 
-        const audioPath =
-          await saveTTSChunkAudio(
-            jobId,
-            chunkIndex,
-            audioBuffer
+          existingSet.add(i);
+          completed += 1;
+
+          const progress = Math.min(
+            85,
+            55 + Math.floor((completed / chunks.length) * 30)
           );
 
-        await upsertAudioChunk(
-          jobId,
-          chunkIndex,
-          text,
-          audioPath,
-          "completed",
-          null
-        );
+          await updateJob(job.id, {
+            tts_completed_chunks: completed,
+            progress,
+            error: null,
+          });
 
-        completed++;
+          if (
+            completed === 1 ||
+            completed === chunks.length ||
+            completed % 3 === 0
+          ) {
+            await sendMessage(
+              targetChat,
+              `🎙️ TTS ${completed}/${chunks.length}\nProgress: ${progress}%`
+            );
+          }
+        } catch (error) {
+          fatal = {
+            index: i,
+            error,
+          };
 
-        await updateJob(jobId, {
-          tts_completed_chunks:
-            completed,
-        });
-
-        if (
-          completed === 1 ||
-          completed === chunks.length ||
-          completed % 3 === 0
-        ) {
-          await sendMessage(
-            chatId,
-            `TTS: ${completed}/${chunks.length} chunks completed.`
+          await db(
+            `INSERT INTO job_audio_chunks
+              (job_id,chunk_index,status,error)
+             VALUES($1,$2,'failed',$3)
+             ON CONFLICT(job_id,chunk_index)
+             DO UPDATE SET
+               status='failed',
+               error=EXCLUDED.error,
+               updated_at=NOW()`,
+            [job.id, i, error.message]
           );
+
+          return;
         }
-      } catch (error) {
-        await upsertAudioChunk(
-          jobId,
-          chunkIndex,
-          text,
-          null,
-          "failed",
-          String(
-            error?.message || error
-          )
-        );
-
-        throw error;
       }
     }
-  }
-
-  const workers = Math.min(
-    3,
-    Math.max(
-      1,
-      pendingIndexes.length
-    )
   );
 
-  try {
-    await Promise.all(
-      Array.from(
-        { length: workers },
-        () => worker()
-      )
-    );
-  } catch (error) {
-    await updateJob(jobId, {
+  await Promise.all(workers);
+
+  if (fatal) {
+    await updateJob(job.id, {
       status: "paused",
-      error: String(
-        error?.message || error
-      ),
+      stage: "tts",
+      error: fatal.error.message,
     });
 
     await sendMessage(
-      chatId,
-      `Job #${jobId} फिलहाल pause हो गया है।\n\nजो TTS chunks बन चुके हैं वे सुरक्षित हैं।\n\n/resume ${jobId} भेजकर वहीं से जारी कर सकते हो।`
+      targetChat,
+      `⏸️ JOB PAUSED SAFELY
+
+TTS chunk ${fatal.index + 1}/${chunks.length} failed.
+
+Completed chunks are saved.
+
+Resume with:
+/resume ${job.id}`
     );
 
-    throw error;
+    return null;
   }
 
-  const finalChunks =
-    await getAudioChunks(jobId);
+  const rows = await db(
+    `SELECT audio_data
+     FROM job_audio_chunks
+     WHERE job_id=$1 AND status='completed'
+     ORDER BY chunk_index`,
+    [job.id]
+  );
 
-  const audioPaths =
-    finalChunks
-      .filter(
-        item =>
-          item.status === "completed" &&
-          item.audio_path
-      )
-      .sort(
-        (a, b) =>
-          a.chunk_index -
-          b.chunk_index
-      )
-      .map(
-        item => item.audio_path
-      );
-
-  if (
-    audioPaths.length !==
-    chunks.length
-  ) {
+  if (rows.rows.length !== chunks.length) {
     throw new Error(
-      `TTS incomplete: ${audioPaths.length}/${chunks.length}`
+      `Not all TTS chunks completed (${rows.rows.length}/${chunks.length})`
     );
   }
 
-  return audioPaths;
-}
-
-async function concatenateAudio(
-  audioPaths,
-  outputPath
-) {
-  if (!audioPaths.length) {
-    throw new Error(
-      "No audio chunks to concatenate"
-    );
-  }
-
-  const listPath =
-    path.join(
-      path.dirname(outputPath),
-      "audio-list.txt"
-    );
-
-  const content =
-    audioPaths
-      .map(
-        filePath =>
-          `file '${String(filePath).replaceAll("'", "'\\''")}'`
-      )
-      .join("\n");
-
-  await fs.writeFile(
-    listPath,
-    content,
-    "utf8"
+  const audio = concatWavBuffers(
+    rows.rows.map((row) => row.audio_data)
   );
 
-  await runFFmpeg([
-    "-y",
-    "-f",
-    "concat",
-    "-safe",
-    "0",
-    "-i",
-    listPath,
-    "-c:a",
-    "aac",
-    "-b:a",
-    "96k",
-    outputPath,
-  ]);
-
-  return outputPath;
-}
-
-function runFFmpeg(args) {
-  return new Promise(
-    (resolve, reject) => {
-      const child = spawn(
-        ffmpegPath,
-        args,
-        {
-          stdio: [
-            "ignore",
-            "pipe",
-            "pipe",
-          ],
-        }
-      );
-
-      let stdout = "";
-      let stderr = "";
-
-      child.stdout.on(
-        "data",
-        data => {
-          stdout += data.toString();
-        }
-      );
-
-      child.stderr.on(
-        "data",
-        data => {
-          stderr += data.toString();
-        }
-      );
-
-      child.on(
-        "error",
-        reject
-      );
-
-      child.on(
-        "close",
-        code => {
-          if (code === 0) {
-            resolve({
-              stdout,
-              stderr,
-            });
-          } else {
-            reject(
-              new Error(
-                `FFmpeg exited with code ${code}: ${stderr.slice(-4000)}`
-              )
-            );
-          }
-        }
-      );
-    }
-  );
-}
-
-function formatSrtTime(seconds) {
-  const safeSeconds =
-    Math.max(
-      0,
-      Number(seconds) || 0
-    );
-
-  const hours =
-    Math.floor(
-      safeSeconds / 3600
-    );
-
-  const minutes =
-    Math.floor(
-      (safeSeconds % 3600) / 60
-    );
-
-  const secs =
-    Math.floor(
-      safeSeconds % 60
-    );
-
-  const millis =
-    Math.floor(
-      (safeSeconds % 1) * 1000
-    );
-
-  return [
-    String(hours).padStart(2, "0"),
-    String(minutes).padStart(2, "0"),
-    String(secs).padStart(2, "0"),
-  ].join(":") +
-    "," +
-    String(millis).padStart(
-      3,
-      "0"
-    );
-}
-
-function createSrt(script) {
-  const chunks =
-    splitIntoChunks(
-      script,
-      40
-    );
-
-  const lines = [];
-
-  let currentTime = 0;
-
-  for (
-    let i = 0;
-    i < chunks.length;
-    i++
-  ) {
-    const text = chunks[i];
-
-    const duration =
-      Math.max(
-        2,
-        wordCount(text) / 2.4
-      );
-
-    const start =
-      currentTime;
-
-    const end =
-      currentTime + duration;
-
-    lines.push(
-      String(i + 1)
-    );
-
-    lines.push(
-      `${formatSrtTime(start)} --> ${formatSrtTime(end)}`
-    );
-
-    lines.push(text);
-    lines.push("");
-
-    currentTime = end;
-  }
-
-  return lines.join("\n");
-}
-
-async function createVideo(
-  audioPath,
-  videoPath
-) {
-  await runFFmpeg([
-    "-y",
-    "-f",
-    "lavfi",
-    "-i",
-    "color=c=black:s=640x360:r=10",
-    "-i",
-    audioPath,
-    "-shortest",
-    "-c:v",
-    "libx264",
-    "-preset",
-    "ultrafast",
-    "-tune",
-    "stillimage",
-    "-crf",
-    "38",
-    "-pix_fmt",
-    "yuv420p",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "64k",
-    videoPath,
-  ]);
-
-  return videoPath;
-}
-
-async function createThumbnail(
-  videoPath,
-  thumbnailPath
-) {
-  await runFFmpeg([
-    "-y",
-    "-ss",
-    "1",
-    "-i",
-    videoPath,
-    "-frames:v",
-    "1",
-    "-vf",
-    "scale=640:360",
-    thumbnailPath,
-  ]);
-
-  return thumbnailPath;
-}
-
-async function saveMedia(
-  jobId,
-  mediaType,
-  filePath
-) {
-  const buffer =
-    await fs.readFile(filePath);
-
-  const sha256 =
-    crypto
-      .createHash("sha256")
-      .update(buffer)
-      .digest("hex");
-
-  await db(
-    `
-      INSERT INTO job_media (
-        job_id,
-        media_type,
-        file_path,
-        sha256,
-        created_at,
-        updated_at
-      )
-      VALUES (
-        $1,
-        $2,
-        $3,
-        $4,
-        NOW(),
-        NOW()
-      )
-    `,
-    [
-      jobId,
-      mediaType,
-      filePath,
-      sha256,
-    ]
-  );
-
-  return {
-    filePath,
-    sha256,
-  };
-}
-
-async function buildJobMedia(
-  jobId,
-  audioPaths,
-  script
-) {
-  const jobDir =
-    path.join(
-      WORK_DIR,
-      `job-${jobId}`
-    );
-
-  await fs.mkdir(
-    jobDir,
-    {
-      recursive: true,
-    }
-  );
-
-  const finalAudio =
-    path.join(
-      jobDir,
-      "narration.m4a"
-    );
-
-  const videoPath =
-    path.join(
-      jobDir,
-      "video.mp4"
-    );
-
-  const thumbnailPath =
-    path.join(
-      jobDir,
-      "thumbnail.jpg"
-    );
-
-  const captionsPath =
-    path.join(
-      jobDir,
-      "captions.srt"
-    );
-
-  await concatenateAudio(
-    audioPaths,
-    finalAudio
-  );
-
-  await createVideo(
-    finalAudio,
-    videoPath
-  );
-
-  await createThumbnail(
-    videoPath,
-    thumbnailPath
-  );
-
-  await fs.writeFile(
-    captionsPath,
-    createSrt(script),
-    "utf8"
-  );
-
-  await saveMedia(
-    jobId,
-    "audio",
-    finalAudio
-  );
-
-  await saveMedia(
-    jobId,
-    "video",
-    videoPath
-  );
-
-  await saveMedia(
-    jobId,
-    "thumbnail",
-    thumbnailPath
-  );
-
-  await saveMedia(
-    jobId,
-    "captions",
-    captionsPath
-  );
-
-  await updateJob(jobId, {
-    video_path: videoPath,
-    thumbnail_path: thumbnailPath,
-    captions_path: captionsPath,
+  await updateJob(job.id, {
+    tts_completed_chunks: chunks.length,
+    progress: 85,
+    stage: "tts_complete",
+    error: null,
   });
 
   return {
-    audioPath: finalAudio,
-    videoPath,
-    thumbnailPath,
-    captionsPath,
+    audio,
+    chunks,
   };
 }
 
-async function fileSize(
-  filePath
-) {
-  const stat =
-    await fs.stat(filePath);
+function wavDurationSeconds(wav){const f=getWavFormat(wav),pcm=getWavPcm(wav);return pcm.length/(f.sampleRate*f.channels*(f.bits/8));}
 
-  return stat.size;
-}
+function srtTime(seconds){const ms=Math.max(0,Math.round(seconds*1000)),h=Math.floor(ms/3600000),m=Math.floor(ms%3600000/60000),s=Math.floor(ms%60000/1000),x=ms%1000;return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")},${String(x).padStart(3,"0")}`;}
 
-async function ensureTelegramFileSize(
-  filePath
-) {
-  const size =
-    await fileSize(filePath);
+function makeSrt(chunks,audioBuffers){let t=0,n=1,out=[];for(let i=0;i<chunks.length;i++){const words=chunks[i].split(/\s+/),dur=wavDurationSeconds(audioBuffers[i]);for(let p=0;p<words.length;p+=12){const line=words.slice(p,p+12).join(" "),a=t+dur*(p/words.length),b=t+dur*(Math.min(p+12,words.length)/words.length);out.push(`${n++}\n${srtTime(a)} --> ${srtTime(b)}\n${line}\n`);}t+=dur;}return out.join("\n");}
 
-  const maxSize =
-    49 * 1024 * 1024;
+function runFfmpeg(args,timeoutMs=300000){if(!ffmpegPath)throw new Error("ffmpeg-static binary unavailable");return new Promise((resolve,reject)=>{const c=spawn(ffmpegPath,args,{stdio:["ignore","ignore","pipe"]});let err="";const timer=setTimeout(()=>{c.kill("SIGKILL");reject(new Error("FFMPEG_TIMEOUT"));},timeoutMs);c.stderr.on("data",d=>{err+=d.toString();if(err.length>10000)err=err.slice(-10000);});c.on("error",e=>{clearTimeout(timer);reject(e);});c.on("close",code=>{clearTimeout(timer);code===0?resolve():reject(new Error(`FFmpeg failed (${code}): ${err.slice(-2500)}`));});});}
 
-  if (size > maxSize) {
-    throw new Error(
-      `Video is too large for Telegram delivery: ${Math.round(size / 1024 / 1024)}MB`
-    );
-  }
+async function getPersistedMedia(jobId){const r=await db(`SELECT kind,data,mime_type FROM job_media WHERE job_id=$1 AND kind IN ('video','thumbnail','captions')`,[jobId]);const m={};for(const x of r.rows)m[x.kind]={data:Buffer.from(x.data),mimeType:x.mime_type};return m;}
 
-  return size;
-}
+async function saveMedia(jobId,kind,data,mimeType){const b=Buffer.from(data),sha=crypto.createHash("sha256").update(b).digest("hex");await db(`INSERT INTO job_media(job_id,kind,data,mime_type,sha256) VALUES($1,$2,$3,$4,$5) ON CONFLICT(job_id,kind) DO UPDATE SET data=EXCLUDED.data,mime_type=EXCLUDED.mime_type,sha256=EXCLUDED.sha256,updated_at=NOW()`,[jobId,kind,b,mimeType,sha]);}
+
+async function buildVideoPackage(job,audio,chunks){const existing=await getPersistedMedia(job.id);if(existing.video&&existing.thumbnail&&existing.captions)return existing;const dir=await fs.mkdtemp(path.join(os.tmpdir(),`yt-${job.id}-`)),audioPath=path.join(dir,"audio.wav"),srtPath=path.join(dir,"captions.srt"),videoPath=path.join(dir,"video.mp4"),thumbPath=path.join(dir,"thumbnail.jpg");try{const rows=await db(`SELECT audio_data FROM job_audio_chunks WHERE job_id=$1 AND status='completed' ORDER BY chunk_index`,[job.id]),buffers=rows.rows.map(r=>Buffer.from(r.audio_data)),srt=makeSrt(chunks,buffers);await fs.writeFile(audioPath,audio);await fs.writeFile(srtPath,srt);const dur=Math.max(1,wavDurationSeconds(audio));await runFfmpeg(["-y","-f","lavfi","-i","color=c=black:s=640x360:r=10","-i",audioPath,"-t",String(dur),"-c:v","libx264","-preset","ultrafast","-tune","stillimage","-crf","38","-pix_fmt","yuv420p","-c:a","aac","-b:a","64k",videoPath]);const video=await fs.readFile(videoPath);if(video.length>49*1024*1024)throw new Error(`Final video is too large for Telegram: ${(video.length/1048576).toFixed(1)}MB`);await runFfmpeg(["-y","-i",videoPath,"-frames:v","1","-q:v","5",thumbPath]);const thumb=await fs.readFile(thumbPath),cap=Buffer.from(srt,"utf8");await saveMedia(job.id,"video",video,"video/mp4");await saveMedia(job.id,"thumbnail",thumb,"image/jpeg");await saveMedia(job.id,"captions",cap,"application/x-subrip");return{video:{data:video,mimeType:"video/mp4"},thumbnail:{data:thumb,mimeType:"image/jpeg"},captions:{data:cap,mimeType:"application/x-subrip"}};}finally{await fs.rm(dir,{recursive:true,force:true}).catch(()=>{});}}
 
 const jobQueue = new Map();
 let queuePumpRunning = false;
 
-function enqueueJob(
-  jobId,
-  chatId
-) {
-  jobQueue.set(
-    String(jobId),
-    {
-      jobId,
-      chatId,
-    }
-  );
+function processJob(id, chatId = null) {
+  if (!jobQueue.has(id)) {
+    jobQueue.set(id, { id, chatId });
+  }
 
-  pumpQueue();
+  pumpJobQueue().catch((error) => {
+    console.error("Job queue pump failed:", error);
+  });
+
+  return Promise.resolve(true);
 }
 
-async function pumpQueue() {
-  if (queuePumpRunning) {
-    return;
-  }
+async function pumpJobQueue() {
+  if (queuePumpRunning) return;
 
   queuePumpRunning = true;
 
   try {
-    for (;;) {
-      const first =
-        jobQueue.entries().next();
-
-      if (first.done) {
-        break;
-      }
-
-      const [
-        key,
-        item,
-      ] = first.value;
-
-      jobQueue.delete(key);
+    while (jobQueue.size > 0) {
+      const item = jobQueue.values().next().value;
+      jobQueue.delete(item.id);
 
       try {
-        await runJobOnce(
-          item.jobId,
-          item.chatId
-        );
+        await runJobOnce(item.id, item.chatId);
       } catch (error) {
         console.error(
-          "Queued job failed:",
+          `Unhandled worker error for ${item.id}:`,
           error
         );
       }
@@ -1659,341 +1359,102 @@ async function pumpQueue() {
   } finally {
     queuePumpRunning = false;
 
-    if (jobQueue.size) {
-      pumpQueue();
+    if (jobQueue.size > 0) {
+      pumpJobQueue().catch((error) => {
+        console.error("Job queue restart failed:", error);
+      });
     }
   }
-    }
+}
+
 /* =========================
    FULL JOB
 ========================= */
 
-async function runJobOnce(jobId, chatId = null) {
-  const claimed = await db(
+async function runJobOnce(id,chatId=null){const claim=await db(`UPDATE jobs SET status='running',chat_id=COALESCE($2,chat_id),error=NULL,updated_at=NOW() WHERE id=$1 AND status='queued' RETURNING *`,[id,chatId]);if(!claim.rows[0])return false;let job=claim.rows[0],targetChat=chatId||job.chat_id;try{if(!job.script){await updateJob(id,{stage:"script",progress:10});await sendMessage(targetChat,"📝 Generating original script\nProgress: 10%");const r=await generateScript(job.topic),wc=qualityCheck(r.script);await updateJob(id,{script:r.script,progress:50,stage:"quality_checked"});await sendMessage(targetChat,`📝 Script generated — ${r.model}\n\n✅ Quality check passed — ${wc} words\nProgress: 50%`);job=await getJob(id);}const tts=await processTTS(job,targetChat);if(!tts)return false;job=await getJob(id);await updateJob(id,{stage:"video",progress:88,status:"running"});await sendMessage(targetChat,"🎬 Building video + captions + thumbnail\nProgress: 88%");const media=await buildVideoPackage(job,tts.audio,tts.chunks);await updateJob(id,{stage:"delivery",progress:95,status:"running"});await sendMessage(targetChat,"📦 Video package ready\nProgress: 95%");await sendDocument(targetChat,media.video.data,`${id}.mp4`,"video/mp4",`🎬 AI YouTube video completed\nJob: ${id}`);await sendDocument(targetChat,media.thumbnail.data,`${id}-thumbnail.jpg`,"image/jpeg",`🖼️ Thumbnail\nJob: ${id}`);await sendDocument(targetChat,media.captions.data,`${id}-captions.srt`,"application/x-subrip",`📝 Captions\nJob: ${id}`);await updateJob(id,{status:"completed",stage:"completed",progress:100,error:null});await sendMessage(targetChat,`✅ JOB COMPLETED — 100%\n\n🎬 Video + thumbnail + captions delivered.\nJob: ${id}`);return true;}catch(error){console.error(`Job ${id} failed:`,error);await updateJob(id,{status:"paused",error:error.message}).catch(()=>{});await sendMessage(targetChat,`⏸️ JOB PAUSED SAFELY\n\nReason: ${error.message}\n\nCompleted TTS/media are saved.\nResume with:\n/resume ${id}`).catch(()=>{});return false;}}
+
+/* =========================
+   CREATE
+========================= */
+
+async function createJob(topic, chatId) {
+  const id =
+    `job_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+
+  // IMPORTANT:
+  // Telegram chat_id is saved with the job.
+  // This prevents the previous NOT NULL error
+  // and allows safe resume after restart.
+
+  await db(
     `
-      UPDATE jobs
-      SET
-        status = 'processing',
-        chat_id = COALESCE($2, chat_id),
-        error = NULL,
-        updated_at = NOW()
-      WHERE id = $1
-        AND status = 'queued'
-      RETURNING *
+    INSERT INTO jobs
+      (
+        id,
+        topic,
+        chat_id,
+        status,
+        progress,
+        stage
+      )
+    VALUES
+      (
+        $1,
+        $2,
+        $3,
+        'queued',
+        0,
+        'queued'
+      )
     `,
-    [jobId, chatId]
+    [
+      id,
+      topic,
+      chatId,
+    ]
   );
 
-  if (!claimed.rows[0]) {
-    return false;
-  }
+  sendMessage(
+    chatId,
+    `🎬 JOB CREATED\n\nTopic: ${topic}\n\nJob ID: ${id}`
+  ).catch(() => {});
 
-  let job = claimed.rows[0];
-  const targetChat = chatId || job.chat_id;
-
-  try {
-    if (!job.script) {
-      await updateJob(jobId, {
-        status: "processing",
-      });
-
-      await sendMessage(
-        targetChat,
-        "📝 Generating original script..."
-      );
-
-      const generated =
-        await generateScript(job.topic);
-
-      const wc =
-        qualityCheck(generated.text);
-
-      await updateJob(jobId, {
-        script: generated.text,
-        status: "processing",
-      });
-
-      await sendMessage(
-        targetChat,
-        `📝 Script generated — ${generated.model}\n\n✅ Quality check passed — ${wc} words`
-      );
-
-      job = await getJob(jobId);
-    }
-
-    await sendMessage(
-      targetChat,
-      "🎙️ Starting AI narration..."
-    );
-
-    const audioPaths =
-      await processTTSJob(
-        jobId,
-        targetChat
-      );
-
-    job = await getJob(jobId);
-
-    if (!audioPaths?.length) {
-      throw new Error(
-        "No narration audio was generated"
-      );
-    }
-
-    await updateJob(jobId, {
-      status: "processing",
-    });
-
-    await sendMessage(
-      targetChat,
-      "🎬 Building video, thumbnail and captions..."
-    );
-
-    const media =
-      await buildJobMedia(
-        jobId,
-        audioPaths,
-        job.script
-      );
-
-    await ensureTelegramFileSize(
-      media.videoPath
-    );
-
-    await updateJob(jobId, {
-      video_path: media.videoPath,
-      thumbnail_path:
-        media.thumbnailPath,
-      captions_path:
-        media.captionsPath,
-      status: "processing",
-    });
-
-    await sendMessage(
-      targetChat,
-      "📦 Video package ready. Sending files..."
-    );
-
-    await sendDocument(
-      targetChat,
-      media.videoPath,
-      `🎬 AI YouTube video completed\nJob: ${jobId}`
-    );
-
-    await sendPhoto(
-      targetChat,
-      media.thumbnailPath,
-      `🖼️ Thumbnail\nJob: ${jobId}`
-    );
-
-    await sendDocument(
-      targetChat,
-      media.captionsPath,
-      `📝 Captions\nJob: ${jobId}`
-    );
-
-    await updateJob(jobId, {
-      status: "completed",
-      error: null,
-    });
-
-    await sendMessage(
-      targetChat,
-      `✅ JOB COMPLETED — 100%\n\n🎬 Video + thumbnail + captions delivered.\n\nJob: ${jobId}`
-    );
-
-    return true;
-
-  } catch (error) {
+  setImmediate(() => processJob(
+    id,
+    chatId
+  ).catch(async (error) => {
     console.error(
-      `Job ${jobId} failed:`,
+      "Background job error:",
       error
     );
 
     await updateJob(
-      jobId,
+      id,
       {
         status: "paused",
-        error:
-          String(
-            error?.message || error
-          ),
+        error: error.message,
       }
     ).catch(() => {});
 
     await sendMessage(
-      targetChat,
-      `⏸️ JOB PAUSED SAFELY\n\nReason: ${String(
-        error?.message || error
-      )}\n\nCompleted TTS chunks are saved.\n\nResume with:\n/resume ${jobId}`
+      chatId,
+      `⏸️ JOB PAUSED SAFELY
+
+Reason: ${error.message}
+
+Resume with:
+/resume ${id}`
     ).catch(() => {});
+  }));
 
-    return false;
-  }
-}
-
-async function processJob(
-  jobId,
-  chatId = null
-) {
-  return runJobOnce(
-    jobId,
-    chatId
-  );
+  return id;
 }
 
 /* =========================
-   CREATE JOB
+   RESUME
 ========================= */
 
-async function createJob(
-  topic,
-  chatId
-) {
-  const result = await db(
-    `
-      INSERT INTO jobs (
-        topic,
-        chat_id,
-        status
-      )
-      VALUES (
-        $1,
-        $2,
-        'queued'
-      )
-      RETURNING id
-    `,
-    [
-      topic,
-      String(chatId),
-    ]
-  );
-
-  const jobId =
-    result.rows[0].id;
-
-  await sendMessage(
-    chatId,
-    `🎬 JOB CREATED\n\nTopic: ${topic}\n\nJob ID: ${jobId}`
-  );
-
-  enqueueJob(
-    jobId,
-    chatId
-  );
-
-  return jobId;
-}
-
-/* =========================
-   RESUME JOB
-========================= */
-
-async function resumeJob(
-  jobId,
-  chatId
-) {
-  const job =
-    await getJob(jobId);
-
-  if (!job) {
-    await sendMessage(
-      chatId,
-      "❌ Job not found."
-    );
-    return;
-  }
-
-  if (
-    job.chat_id &&
-    String(job.chat_id) !==
-      String(chatId)
-  ) {
-    await sendMessage(
-      chatId,
-      "❌ This job belongs to another chat."
-    );
-    return;
-  }
-
-  if (
-    job.status === "completed"
-  ) {
-    await sendMessage(
-      chatId,
-      "✅ This job is already completed."
-    );
-    return;
-  }
-
-  if (
-    job.status === "processing"
-  ) {
-    await sendMessage(
-      chatId,
-      "ℹ️ This job is already running."
-    );
-    return;
-  }
-
-  if (
-    job.status === "queued"
-  ) {
-    await sendMessage(
-      chatId,
-      "ℹ️ This job is already queued."
-    );
-    return;
-  }
-
-  if (
-    job.status !== "paused"
-  ) {
-    await sendMessage(
-      chatId,
-      `ℹ️ Cannot resume job from status: ${job.status}`
-    );
-    return;
-  }
-
-  const resumed =
-    await db(
-      `
-        UPDATE jobs
-        SET
-          status = 'queued',
-          chat_id = $2,
-          error = NULL,
-          updated_at = NOW()
-        WHERE id = $1
-          AND status = 'paused'
-        RETURNING id
-      `,
-      [
-        jobId,
-        String(chatId),
-      ]
-    );
-
-  if (!resumed.rows[0]) {
-    await sendMessage(
-      chatId,
-      "ℹ️ Resume already started or job state changed."
-    );
-    return;
-  }
-
-  await sendMessage(
-    chatId,
-    `▶️ RESUMING JOB\n\nJob: ${jobId}\n\nSaved script and completed TTS chunks will be reused.`
-  );
-
-  enqueueJob(
-    jobId,
-    chatId
-  );
-}
+async function resumeJob(id,chatId){const job=await getJob(id);if(!job){await sendMessage(chatId,"❌ Job not found.");return;}if(job.chat_id&&String(job.chat_id)!==String(chatId)){await sendMessage(chatId,"❌ This job belongs to another chat.");return;}if(job.status==='completed'){await sendMessage(chatId,"✅ This job is already completed.");return;}if(job.status==='running'){await sendMessage(chatId,"ℹ️ This job is already running.");return;}if(job.status==='queued'){await sendMessage(chatId,"ℹ️ This job is already queued.");return;}if(job.status!=='paused'){await sendMessage(chatId,`ℹ️ Cannot resume job from status: ${job.status}`);return;}const claim=await db(`UPDATE jobs SET status='queued',chat_id=$2,error=NULL,updated_at=NOW() WHERE id=$1 AND status='paused' RETURNING id`,[id,chatId]);if(!claim.rows[0]){await sendMessage(chatId,"ℹ️ Resume already started or job state changed.");return;}await sendMessage(chatId,`▶️ RESUMING JOB\n\n${id}\n\nSaved script, TTS chunks and media will be reused.`);processJob(id,chatId).catch(()=>{});}
 
 /* =========================
    STATUS
@@ -2001,32 +1462,29 @@ async function resumeJob(
 
 async function status(chatId) {
   const result =
-    await db(
-      `
-        SELECT
-          COUNT(*) FILTER (
-            WHERE status = 'processing'
-          )::int AS processing,
+    await db(`
+      SELECT
+        COUNT(*) FILTER (
+          WHERE status = 'running'
+        )::int AS running,
 
-          COUNT(*) FILTER (
-            WHERE status = 'paused'
-          )::int AS paused,
+        COUNT(*) FILTER (
+          WHERE status = 'paused'
+        )::int AS paused,
 
-          COUNT(*) FILTER (
-            WHERE status = 'completed'
-          )::int AS completed,
+        COUNT(*) FILTER (
+          WHERE status = 'completed'
+        )::int AS completed,
 
-          COUNT(*) FILTER (
-            WHERE status = 'queued'
-          )::int AS queued,
+        COUNT(*) FILTER (
+          WHERE status = 'queued'
+        )::int AS queued,
 
-          COUNT(*)::int AS total
+        COUNT(*)::int AS total
 
-        FROM jobs
-        WHERE chat_id = $1
-      `,
-      [String(chatId)]
-    );
+      FROM jobs
+      WHERE chat_id = $1
+    `, [chatId]);
 
   const s =
     result.rows[0];
@@ -2037,11 +1495,13 @@ async function status(chatId) {
 
 Backend: ONLINE ✅
 
-Processing: ${s.processing}
+Running: ${s.running}
 Queued: ${s.queued}
 Paused: ${s.paused}
 Completed: ${s.completed}
-Total: ${s.total}`
+Total: ${s.total}
+
+Payment mode: APPROVAL ONLY`
   );
 }
 
@@ -2052,40 +1512,11 @@ Total: ${s.total}`
 app.post(
   "/telegram/webhook",
   async (req, res) => {
+
     try {
-      if (
-        WEBHOOK_SECRET &&
-        req.get(
-          "X-Telegram-Bot-Api-Secret-Token"
-        ) !== WEBHOOK_SECRET
-      ) {
-        return res.sendStatus(401);
-      }
-
-      const updateId =
-        req.body?.update_id;
-
-      if (
-        Number.isSafeInteger(updateId)
-      ) {
-        const inserted =
-          await db(
-            `
-              INSERT INTO telegram_updates (
-                update_id
-              )
-              VALUES ($1)
-              ON CONFLICT DO NOTHING
-              RETURNING update_id
-            `,
-            [updateId]
-          );
-
-        if (!inserted.rows[0]) {
-          return res.sendStatus(200);
-        }
-      }
-
+      if(WEBHOOK_SECRET&&req.get("X-Telegram-Bot-Api-Secret-Token")!==WEBHOOK_SECRET)return res.sendStatus(401);
+      const updateId=req.body?.update_id;
+      if(Number.isSafeInteger(updateId)){const ins=await db(`INSERT INTO telegram_updates(update_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING update_id`,[updateId]);if(!ins.rows[0])return res.sendStatus(200);}
       res.sendStatus(200);
 
       const message =
@@ -2104,7 +1535,12 @@ app.post(
       const text =
         message.text.trim();
 
+      /* =====================
+         /start
+      ===================== */
+
       if (text === "/start") {
+
         await sendMessage(
           chatId,
           `🤖 AI YouTube Autopilot
@@ -2114,7 +1550,9 @@ ONLINE ✅
 Commands:
 
 /create <topic>
+
 /status
+
 /resume <job_id>
 
 Example:
@@ -2125,24 +1563,39 @@ Example:
         return;
       }
 
+      /* =====================
+         /status
+      ===================== */
+
       if (text === "/status") {
-        await status(chatId);
+
+        await status(
+          chatId
+        );
+
         return;
       }
+
+      /* =====================
+         /create
+      ===================== */
 
       if (
         text.startsWith("/create ")
       ) {
+
         const topic =
           text
             .substring(8)
             .trim();
 
         if (!topic) {
+
           await sendMessage(
             chatId,
             "Use: /create <topic>"
           );
+
           return;
         }
 
@@ -2154,19 +1607,26 @@ Example:
         return;
       }
 
+      /* =====================
+         /resume
+      ===================== */
+
       if (
         text.startsWith("/resume ")
       ) {
+
         const id =
           text
             .substring(8)
             .trim();
 
         if (!id) {
+
           await sendMessage(
             chatId,
             "Use: /resume <job_id>"
           );
+
           return;
         }
 
@@ -2177,6 +1637,10 @@ Example:
 
         return;
       }
+
+      /* =====================
+         UNKNOWN COMMAND
+      ===================== */
 
       await sendMessage(
         chatId,
@@ -2191,11 +1655,14 @@ Use:
       );
 
     } catch (error) {
+
       console.error(
         "Webhook processing error:",
         error
       );
+
     }
+
   }
 );
 
@@ -2206,12 +1673,14 @@ Use:
 app.get(
   "/",
   (req, res) => {
+
     res.json({
       ok: true,
       service:
         "AI YouTube Autopilot",
       status: "online",
     });
+
   }
 );
 
@@ -2220,13 +1689,20 @@ app.get(
 ========================= */
 
 async function startup() {
+
   try {
+
     await initDatabase();
+
+    /* =====================
+       TELEGRAM WEBHOOK
+    ===================== */
 
     if (
       WEBHOOK_URL &&
       TELEGRAM_BOT_TOKEN
     ) {
+
       console.log(
         "Setting Telegram webhook:",
         WEBHOOK_URL
@@ -2254,25 +1730,36 @@ async function startup() {
       );
     }
 
+    /* =====================
+       RECOVERY
+    ===================== */
+
+    // If Render restarts while a job
+    // was running, put it back into
+    // queued state instead of losing it.
+
     const recovery =
-      await db(
-        `
-          UPDATE jobs
-          SET
-            status = 'queued',
-            updated_at = NOW()
-          WHERE status = 'processing'
-          RETURNING id
-        `
-      );
+      await db(`
+        UPDATE jobs
+        SET
+          status = 'queued',
+          updated_at = NOW()
+        WHERE status = 'running'
+        RETURNING id
+      `);
 
     console.log(
-      `Recovered ${recovery.rows.length} interrupted job(s)`
+      `Recovered ${recovery.rows.length} interrupted job(s) to queued state`
     );
+
+    /* =====================
+       SERVER
+    ===================== */
 
     app.listen(
       PORT,
       () => {
+
         console.log(
           `AI YouTube Autopilot listening on port ${PORT}`
         );
@@ -2281,42 +1768,31 @@ async function startup() {
           "STARTUP COMPLETE"
         );
 
-        setTimeout(
-          async () => {
-            try {
-              const queued =
-                await db(
-                  `
-                    SELECT id, chat_id
-                    FROM jobs
-                    WHERE status = 'queued'
-                    ORDER BY created_at ASC
-                    LIMIT 10
-                  `
-                );
+        // Resume jobs that were queued/recovered during a previous
+        // process lifetime. Existing completed TTS chunks are reused.
+        setTimeout(async () => {
+          try {
+            const queued = await db(`
+              SELECT id, chat_id
+              FROM jobs
+              WHERE status = 'queued'
+              ORDER BY created_at ASC
+              LIMIT 10
+            `);
 
-              for (
-                const row of
-                  queued.rows
-              ) {
-                enqueueJob(
-                  row.id,
-                  row.chat_id
-                );
-              }
-            } catch (error) {
-              console.error(
-                "Queued-job recovery failed:",
-                error
-              );
+            for (const row of queued.rows) {
+              processJob(row.id, row.chat_id);
             }
-          },
-          1000
-        );
+          } catch (error) {
+            console.error("Queued-job recovery failed:", error);
+          }
+        }, 1000);
+
       }
     );
 
   } catch (error) {
+
     console.error(
       "STARTUP FAILED:",
       error
@@ -2333,22 +1809,26 @@ async function startup() {
 process.on(
   "SIGTERM",
   async () => {
+
     await pool
       .end()
       .catch(() => {});
 
     process.exit(0);
+
   }
 );
 
 process.on(
   "SIGINT",
   async () => {
+
     await pool
       .end()
       .catch(() => {});
 
     process.exit(0);
+
   }
 );
 
