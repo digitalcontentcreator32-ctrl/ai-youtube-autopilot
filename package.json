@@ -4,8 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "python3 -m venv .piper-venv && .piper-venv/bin/python -m pip install --upgrade pip --disable-pip-version-check --no-input && .piper-venv/bin/python -m pip install --disable-pip-version-check --no-input piper-tts && mkdir -p .piper-voices && .piper-venv/bin/python -m piper.download_voices en_US-lessac-medium --data-dir .piper-voices && .piper-venv/bin/python -m piper.download_voices en_US-lessac-low --data-dir .piper-voices && printf '%s\\n' 'Piper smoke test' | .piper-venv/bin/python -m piper --model .piper-voices/en_US-lessac-medium.onnx --data-dir .piper-voices --download-dir .piper-voices --output_file .piper-smoke.wav && test -s .piper-smoke.wav && rm -f .piper-smoke.wav"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^5.1.0",

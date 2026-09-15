@@ -147,6 +147,16 @@ async function initDatabase() {
   `);
 
   await db(`
+    ALTER TABLE job_media
+    ADD COLUMN IF NOT EXISTS data BYTEA
+  `);
+
+  await db(`
+    ALTER TABLE job_media
+    ADD COLUMN IF NOT EXISTS mime_type TEXT
+  `);
+
+  await db(`
     CREATE TABLE IF NOT EXISTS telegram_updates (
       update_id BIGINT PRIMARY KEY,
       received_at TIMESTAMPTZ DEFAULT NOW()
@@ -211,6 +221,23 @@ async function initDatabase() {
   await db(`
     ALTER TABLE job_audio_chunks
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'job_audio_chunks'
+          AND column_name = 'audio'
+      ) THEN
+        UPDATE job_audio_chunks
+        SET audio_data = audio
+        WHERE audio_data IS NULL AND audio IS NOT NULL;
+      END IF;
+    END $$;
   `);
 
   await db(`
@@ -462,6 +489,8 @@ async function geminiRequest(
 
       error.status =
         response.status;
+      error.retryAfterMs =
+        Number(response.headers.get("retry-after")) * 1000 || 0;
 
       throw error;
     }
@@ -761,16 +790,13 @@ const ELEVENLABS_API_KEY =
   process.env.ELEVENLABS_API_KEY;
 
 const ELEVENLABS_MODEL_ID =
-  process.env.ELEVENLABS_MODEL_ID ||
   "eleven_flash_v2_5";
 
 const ELEVENLABS_HINDI_VOICE_ID =
-  process.env.ELEVENLABS_HINDI_VOICE_ID ||
-  "x9wViLHrpGxKBhkUybpR";
+  process.env.ELEVENLABS_HINDI_VOICE_ID;
 
 const ELEVENLABS_ENGLISH_VOICE_ID =
-  process.env.ELEVENLABS_ENGLISH_VOICE_ID ||
-  "XmUeU0FRyne67Dy7UaT4";
+  process.env.ELEVENLABS_ENGLISH_VOICE_ID;
 
 const GOOGLE_TTS_HI_VOICE_NAME =
   process.env.GOOGLE_TTS_HI_VOICE_NAME ||
@@ -1030,15 +1056,11 @@ async function elevenLabsTTS(
     }
 
     return {
-      buffer:
-        pcmToWav(
-          rawBuffer,
-          16000,
-          1,
-          16
-        ),
-      mimeType:
-        "audio/wav",
+      buffer: rawBuffer,
+      mimeType: "audio/pcm",
+      sampleRate: 16000,
+      channels: 1,
+      bits: 16,
       model:
         `elevenlabs:${ELEVENLABS_MODEL_ID}`,
       provider:
@@ -1136,6 +1158,8 @@ async function googleCloudTTS(
 
     error.status =
       response.status;
+    error.retryAfterMs =
+      Number(response.headers.get("retry-after")) * 1000 || 0;
 
     throw error;
   }
@@ -1164,7 +1188,11 @@ async function googleCloudTTS(
   return {
     buffer,
     mimeType:
-      "audio/wav",
+      "audio/pcm",
+    sampleRate:
+      24000,
+    channels: 1,
+    bits: 16,
     model:
       `google-cloud:${name}`,
     provider:
@@ -1274,101 +1302,201 @@ ${text}
 }
 
 async function generateTTSWithRetry(
-  text
+  text,
+  chunkIndex = 0
 ) {
-  let currentText =
-    String(text || "")
-      .trim();
-
-  let lastError =
-    null;
+  let currentText = String(text || "").trim();
 
   if (!currentText) {
-    throw new Error(
-      "Empty TTS chunk"
-    );
+    throw new Error("Empty TTS chunk");
   }
 
-  try {
-    return await elevenLabsTTS(
-      currentText
-    );
-  } catch (error) {
-    lastError =
-      error;
+  const runProvider = async (provider, model, operation) => {
+    let lastError;
 
-    console.log(
-      `ElevenLabs TTS failed: ${error.message}`
-    );
-  }
-
-  if (
-    isContentBlockedError(
-      lastError
-    )
-  ) {
-    try {
-      currentText =
-        await rewriteForSafeTTS(
-          currentText
-        );
-
-      return await elevenLabsTTS(
-        currentText
-      );
-    } catch (error) {
-      lastError =
-        error;
-    }
-  }
-
-  console.log(
-    "Falling back to Google Cloud TTS..."
-  );
-
-  try {
-    return await googleCloudTTS(
-      currentText
-    );
-  } catch (googleError) {
-    console.log(
-      `Google Cloud TTS failed: ${googleError.message}`
-    );
-
-    if (
-      isContentBlockedError(
-        lastError
-      )
-    ) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const rewritten =
-          await rewriteForSafeTTS(
-            currentText
-          );
+        const result = await operation();
+        const normalized = await normalizeAudioResult(result);
+        console.log(JSON.stringify({
+          event: "tts_success",
+          provider,
+          model,
+          chunk: chunkIndex,
+          attempt,
+        }));
+        return normalized;
+      } catch (error) {
+        lastError = error;
+        const status = Number(error.status) || null;
+        const category = isContentBlockedError(error)
+          ? "content_blocked"
+          : error.code === "TIMEOUT"
+            ? "timeout"
+            : status === 429
+              ? "rate_limit"
+              : status && status >= 500
+                ? "provider_server"
+                : status && status >= 400
+                  ? "provider_client"
+                  : "network";
 
-        return await googleCloudTTS(
-          rewritten
+        console.log(JSON.stringify({
+          event: "tts_failure",
+          provider,
+          model,
+          chunk: chunkIndex,
+          attempt,
+          status,
+          category,
+        }));
+
+        const retryable =
+          error.code === "TIMEOUT" ||
+          !status ||
+          status === 408 ||
+          status === 425 ||
+          status === 429 ||
+          status >= 500;
+
+        if (!retryable || attempt === 3) break;
+
+        const wait = Math.min(
+          30000,
+          Number(error.retryAfterMs) || 1500 * (2 ** (attempt - 1))
         );
-      } catch (rewriteGoogleError) {
-        throw new Error(
-          `TTS failed after safe rewrite. ElevenLabs: ${
-            lastError?.message ||
-            "unknown"
-          }; Google: ${
-            rewriteGoogleError.message
-          }`
-        );
+        await sleep(wait + Math.floor(Math.random() * 500));
       }
     }
 
-    throw new Error(
-      `TTS failed. ElevenLabs: ${
-        lastError?.message ||
-        "unknown"
-      }; Google: ${
-        googleError.message
-      }`
+    throw lastError;
+  };
+
+  let elevenError;
+
+  try {
+    return await runProvider(
+      "elevenlabs",
+      ELEVENLABS_MODEL_ID,
+      () => elevenLabsTTS(currentText)
     );
+  } catch (error) {
+    elevenError = error;
+  }
+
+  if (isContentBlockedError(elevenError)) {
+    try {
+      currentText = await rewriteForSafeTTS(currentText);
+      return await runProvider(
+        "elevenlabs",
+        ELEVENLABS_MODEL_ID,
+        () => elevenLabsTTS(currentText)
+      );
+    } catch (error) {
+      elevenError = error;
+    }
+  }
+
+  let googleError;
+
+  try {
+    return await runProvider(
+      "google-cloud",
+      isHindiText(currentText) ? GOOGLE_TTS_HI_VOICE_NAME : GOOGLE_TTS_EN_VOICE_NAME,
+      () => googleCloudTTS(currentText)
+    );
+  } catch (error) {
+    googleError = error;
+  }
+
+  if (isContentBlockedError(googleError) && !isContentBlockedError(elevenError)) {
+    currentText = await rewriteForSafeTTS(currentText);
+    return runProvider(
+      "google-cloud",
+      isHindiText(currentText) ? GOOGLE_TTS_HI_VOICE_NAME : GOOGLE_TTS_EN_VOICE_NAME,
+      () => googleCloudTTS(currentText)
+    );
+  }
+
+  throw new Error(
+    `TTS providers exhausted: ElevenLabs ${elevenError?.status || elevenError?.code || "failed"}; Google ${googleError?.status || googleError?.code || "failed"}`
+  );
+}
+
+async function normalizeAudioResult(result) {
+  if (!result?.buffer?.length) {
+    throw new Error("TTS returned empty audio");
+  }
+
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "tts-"));
+  const inputPath = path.join(dir, "input");
+  const outputPath = path.join(dir, "output.wav");
+
+  try {
+    await fs.writeFile(inputPath, result.buffer);
+
+    const inputArgs = result.mimeType === "audio/pcm"
+      ? [
+          "-f", `s${result.bits || 16}le`,
+          "-ar", String(result.sampleRate || 24000),
+          "-ac", String(result.channels || 1),
+        ]
+      : [];
+
+    await runFfmpeg([
+      "-y",
+      ...inputArgs,
+      "-i", inputPath,
+      "-ar", "24000",
+      "-ac", "1",
+      "-c:a", "pcm_s16le",
+      outputPath,
+    ], 120000);
+
+    return {
+      buffer: await fs.readFile(outputPath),
+      mimeType: "audio/wav",
+      model: result.model,
+      provider: result.provider,
+    };
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function generateChunkAudio(text, chunkIndex) {
+  try {
+    return await generateTTSWithRetry(text, chunkIndex);
+  } catch (error) {
+    const words = String(text).trim().split(/\s+/).filter(Boolean);
+
+    if (words.length < 40) {
+      throw error;
+    }
+
+    const midpoint = Math.ceil(words.length / 2);
+    const parts = [
+      words.slice(0, midpoint).join(" "),
+      words.slice(midpoint).join(" "),
+    ];
+
+    console.log(JSON.stringify({
+      event: "tts_chunk_split",
+      chunk: chunkIndex,
+      words: words.length,
+    }));
+
+    const results = [];
+    for (let part = 0; part < parts.length; part++) {
+      results.push(await generateChunkAudio(`${parts[part]}`, `${chunkIndex}.${part + 1}`));
+    }
+
+    return {
+      buffer: concatWavBuffers(results.map((item) => item.buffer)),
+      mimeType: "audio/wav",
+      model: results.map((item) => item.model).join(","),
+      provider: results.map((item) => item.provider).join(","),
+    };
   }
 }
 
@@ -1736,7 +1864,7 @@ async function processTTS(
                 30
             )
         ),
-      status: "running",
+      status: "tts",
       error: null,
     }
   );
@@ -1782,8 +1910,9 @@ async function processTTS(
             );
 
             const result =
-              await generateTTSWithRetry(
-                chunks[i]
+              await generateChunkAudio(
+                chunks[i],
+                i
               );
 
             await db(
@@ -2609,7 +2738,7 @@ async function runJobOnce(
     await db(
       `UPDATE jobs
        SET
-         status='running',
+         status='processing',
          chat_id=COALESCE(
            $2,
            chat_id
@@ -2701,7 +2830,7 @@ async function runJobOnce(
       {
         stage: "video",
         progress: 88,
-        status: "running",
+        status: "video",
       }
     );
 
@@ -2721,10 +2850,10 @@ async function runJobOnce(
       id,
       {
         stage:
-          "delivery",
+          "delivering",
         progress: 95,
         status:
-          "running",
+          "delivering",
       }
     );
 
@@ -2924,10 +3053,12 @@ async function resumeJob(
     return;
   }
 
-  if (
-    job.status ===
-    "running"
-  ) {
+  if ([
+    "processing",
+    "tts",
+    "video",
+    "delivering",
+  ].includes(job.status)) {
     await sendMessage(
       chatId,
       "ℹ️ This job is already running."
@@ -3011,7 +3142,7 @@ async function status(
       `
       SELECT
         COUNT(*) FILTER (
-          WHERE status = 'running'
+          WHERE status IN ('processing', 'tts', 'video', 'delivering')
         )::int AS running,
 
         COUNT(*) FILTER (
@@ -3312,7 +3443,7 @@ async function startup() {
         SET
           status = 'queued',
           updated_at = NOW()
-        WHERE status = 'running'
+        WHERE status IN ('processing', 'tts', 'video', 'delivering')
         RETURNING id
         `
       );
