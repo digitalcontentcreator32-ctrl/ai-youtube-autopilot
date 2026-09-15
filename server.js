@@ -77,6 +77,25 @@ async function initDatabase() {
     ADD COLUMN IF NOT EXISTS chat_id BIGINT
   `);
 
+  // Canonical ID type: all job IDs are strings (job_<timestamp>_<random>).
+  // Existing older deployments may have created BIGINT/SERIAL IDs. Convert
+  // them once so new and resumed jobs use one consistent schema.
+  const jobIdType = await db(`
+    SELECT data_type
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'jobs'
+      AND column_name = 'id'
+  `);
+
+  if (jobIdType.rows[0]?.data_type !== 'text') {
+    await db(`
+      ALTER TABLE jobs
+      ALTER COLUMN id TYPE TEXT
+      USING id::text
+    `);
+  }
+
   await db(`
     ALTER TABLE jobs
     ADD COLUMN IF NOT EXISTS script TEXT
@@ -122,6 +141,22 @@ async function initDatabase() {
   // Create media table BEFORE running migrations against it.
   await db(`CREATE TABLE IF NOT EXISTS job_media (job_id TEXT NOT NULL, kind TEXT NOT NULL, data BYTEA NOT NULL, mime_type TEXT NOT NULL, sha256 TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (job_id, kind))`);
   await db(`ALTER TABLE job_media ADD COLUMN IF NOT EXISTS sha256 TEXT`);
+
+  const mediaJobIdType = await db(`
+    SELECT data_type
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'job_media'
+      AND column_name = 'job_id'
+  `);
+
+  if (mediaJobIdType.rows[0]?.data_type !== 'text') {
+    await db(`
+      ALTER TABLE job_media
+      ALTER COLUMN job_id TYPE TEXT
+      USING job_id::text
+    `);
+  }
   await db(`ALTER TABLE job_media ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
   await db(`ALTER TABLE job_media ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
   await db(`CREATE TABLE IF NOT EXISTS telegram_updates (update_id BIGINT PRIMARY KEY, received_at TIMESTAMPTZ DEFAULT NOW())`);
@@ -168,6 +203,22 @@ async function initDatabase() {
     ALTER TABLE job_audio_chunks
     ADD COLUMN IF NOT EXISTS job_id TEXT
   `);
+
+  const chunkJobIdType = await db(`
+    SELECT data_type
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'job_audio_chunks'
+      AND column_name = 'job_id'
+  `);
+
+  if (chunkJobIdType.rows[0]?.data_type !== 'text') {
+    await db(`
+      ALTER TABLE job_audio_chunks
+      ALTER COLUMN job_id TYPE TEXT
+      USING job_id::text
+    `);
+  }
 
   await db(`
     ALTER TABLE job_audio_chunks
@@ -307,9 +358,7 @@ async function telegram(method, body = {}) {
     `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }
   );
@@ -498,10 +547,50 @@ async function retryGemini(
 ========================= */
 
 async function generateScript(topic) {
+  const topicText = String(topic || "").trim();
+
+  // Keep short requests genuinely short.
+  const countMatch = topicText.match(/\b(\d{1,2})\b/);
+  const hindiCountWords = {
+    "एक": 1, "दो": 2, "तीन": 3, "चार": 4, "पाँच": 5, "पांच": 5,
+    "छह": 6, "छः": 6, "सात": 7, "आठ": 8, "नौ": 9, "दस": 10,
+  };
+  const hindiCountMatch = Object.keys(hindiCountWords).find((word) =>
+    new RegExp(`(?:^|\\s)${word}(?:$|\\s)`, "u").test(topicText)
+  );
+  const requestedCount = countMatch
+    ? Number(countMatch[1])
+    : hindiCountMatch
+      ? hindiCountWords[hindiCountMatch]
+      : null;
+
+  let targetWords = 600;
+  let maxWords = 750;
+
+  if (requestedCount === 1) {
+    targetWords = 180;
+    maxWords = 240;
+  } else if (requestedCount === 2) {
+    targetWords = 240;
+    maxWords = 300;
+  } else if (requestedCount === 3) {
+    targetWords = 300;
+    maxWords = 380;
+  } else if (requestedCount === 4) {
+    targetWords = 360;
+    maxWords = 450;
+  } else if (requestedCount === 5) {
+    targetWords = 450;
+    maxWords = 550;
+  } else if (requestedCount >= 6 && requestedCount <= 10) {
+    targetWords = Math.min(700, 120 + requestedCount * 58);
+    maxWords = targetWords + 100;
+  }
+
   const prompt = `
 Create an original YouTube narration script about:
 
-${topic}
+${topicText}
 
 Requirements:
 - Completely original wording.
@@ -510,9 +599,13 @@ Requirements:
 - No copied article wording.
 - No fake citations.
 - Suitable for a faceless YouTube video.
-- Around 600-800 words.
+- Target approximately ${targetWords} words.
+- HARD LIMIT: do not exceed ${maxWords} words.
+- If the topic asks for a specific number of facts/items, cover exactly that number.
+- Keep explanations concise; do not pad the script.
 - Natural spoken narration.
 - No stage directions.
+- Return ONLY the narration script.
 `;
 
   let lastError;
@@ -529,8 +622,8 @@ Requirements:
             },
           ],
           generationConfig: {
-            temperature: 0.8,
-            maxOutputTokens: 3000,
+            temperature: 0.7,
+            maxOutputTokens: Math.max(900, Math.ceil(maxWords * 2.2)),
           },
         },
         45000,
@@ -543,22 +636,33 @@ Requirements:
         .trim();
 
       if (text) {
-        return {
-          script: text,
-          model,
-        };
+        // Final local guard: even if Gemini ignores the requested length,
+        // never allow a short job to become a 1000-word narration.
+        const words = text.split(/\s+/).filter(Boolean);
+        if (words.length > maxWords) {
+          const limited = words.slice(0, maxWords).join(" ");
+          const lastStop = Math.max(
+            limited.lastIndexOf("."),
+            limited.lastIndexOf("!"),
+            limited.lastIndexOf("?")
+          );
+          const trimmed =
+            lastStop >= Math.floor(limited.length * 0.65)
+              ? limited.slice(0, lastStop + 1).trim()
+              : limited.trim();
+
+          return { script: trimmed, model };
+        }
+
+        return { script: text, model };
       }
     } catch (error) {
-      console.log(
-        `Script model failed: ${model}: ${error.message}`
-      );
-
+      console.log(`Script model failed: ${model}: ${error.message}`);
       lastError = error;
     }
   }
 
-  throw lastError ||
-    new Error("All script models failed");
+  throw lastError || new Error("All script models failed");
 }
 
 /* =========================
@@ -734,7 +838,6 @@ async function generateTTSChunk(text, model) {
     }
 
     const rawBuffer = Buffer.from(audioData, "base64");
-
     const mimeType =
       String(audioOutput?.mime_type || "audio/wav")
         .split(";")[0]
@@ -743,7 +846,7 @@ async function generateTTSChunk(text, model) {
 
     const parsedRate =
       String(audioOutput?.mime_type || "")
-        .match(/(?:rate|sample[_-]?rate)\s*=\s*(\d+)/i);
+        .match(/(?:rate|sample[_-]?rate)\\s*=\\s*(\\d+)/i);
 
     const sampleRate =
       audioOutput?.sample_rate ||
@@ -787,7 +890,6 @@ async function generateTTSChunk(text, model) {
 
 function isContentBlockedError(error) {
   const text = String(error?.message || "").toLowerCase();
-
   return (
     text.includes("content_blocked") ||
     text.includes("request blocked") ||
@@ -853,56 +955,68 @@ async function generateTTSWithRetry(text) {
     throw new Error("Empty TTS chunk");
   }
 
-  for (let safetyPass = 0; safetyPass < 2; safetyPass++) {
-    for (const model of TTS_MODELS) {
-      for (let attempt = 1; attempt <= 3; attempt++) {
+  // Fast path: one attempt per model. Only transient API failures get one
+  // short retry. Policy blocks are rewritten once instead of being retried
+  // repeatedly for minutes.
+  for (const model of TTS_MODELS) {
+    try {
+      return {
+        ...(await generateTTSChunk(currentText, model)),
+        model,
+        textUsed: currentText,
+      };
+} catch (error) {
+      lastError = error;
+
+      if (isContentBlockedError(error)) {
+        console.log(`TTS content blocked model=${model}; applying safe rewrite`);
+
         try {
+          currentText = await rewriteForSafeTTS(currentText);
           return {
             ...(await generateTTSChunk(currentText, model)),
             model,
             textUsed: currentText,
           };
-        } catch (error) {
-          lastError = error;
-
-          if (isContentBlockedError(error)) {
-            console.log(
-              `TTS content blocked model=${model} pass=${safetyPass + 1}`
-            );
-            break;
-          }
-
-          const retryable =
-            error.code === "TIMEOUT" ||
-            [429, 500, 502, 503].includes(error.status);
-
-          console.log(
-            `TTS failed model=${model} attempt=${attempt} status=${error.status || "none"}: ${error.message}`
-          );
-
-          if (!retryable || attempt === 3) {
-            break;
-          }
-
-          const wait =
-            error.status === 429
-              ? 5000 * attempt
-              : 2000 + Math.floor(Math.random() * 2500);
-
-          await sleep(wait);
+        } catch (rewriteError) {
+          lastError = rewriteError;
+          console.log(`Safe TTS retry failed model=${model}: ${rewriteError.message}`);
         }
+
+        continue;
+      }
+
+      const retryable =
+        error.code === "TIMEOUT" ||
+        [429, 500, 502, 503].includes(error.status);
+
+      if (!retryable) {
+        continue;
+      }
+
+      const wait =
+        error.status === 429
+          ? 2500
+          : 1000 + Math.floor(Math.random() * 1000);
+
+      await sleep(wait);
+
+      try {
+        return {
+          ...(await generateTTSChunk(currentText, model)),
+          model,
+          textUsed: currentText,
+        };
+      } catch (retryError) {
+        lastError = retryError;
+        console.log(`TTS retry failed model=${model}: ${retryError.message}`);
       }
     }
+  }
 
-    if (safetyPass === 0 && isContentBlockedError(lastError)) {
-      currentText = await rewriteForSafeTTS(currentText);
-      continue;
-    }
-
-    break;
-}
   throw lastError || new Error("All TTS models failed");
 }
+
 
 /* =========================
    WAV HELPERS
@@ -1226,7 +1340,7 @@ async function processTTS(job, chatId) {
           ) {
             await sendMessage(
               targetChat,
-              `🎙️ TTS ${completed}/${chunks.length}\nProgress: ${progress}%`
+              `🎙️ TTS ${completed}/${chunks.length}\\nProgress: ${progress}%`
             );
           }
         } catch (error) {
@@ -1308,18 +1422,13 @@ Resume with:
   };
 }
 
+
 function wavDurationSeconds(wav){const f=getWavFormat(wav),pcm=getWavPcm(wav);return pcm.length/(f.sampleRate*f.channels*(f.bits/8));}
-
 function srtTime(seconds){const ms=Math.max(0,Math.round(seconds*1000)),h=Math.floor(ms/3600000),m=Math.floor(ms%3600000/60000),s=Math.floor(ms%60000/1000),x=ms%1000;return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")},${String(x).padStart(3,"0")}`;}
-
 function makeSrt(chunks,audioBuffers){let t=0,n=1,out=[];for(let i=0;i<chunks.length;i++){const words=chunks[i].split(/\s+/),dur=wavDurationSeconds(audioBuffers[i]);for(let p=0;p<words.length;p+=12){const line=words.slice(p,p+12).join(" "),a=t+dur*(p/words.length),b=t+dur*(Math.min(p+12,words.length)/words.length);out.push(`${n++}\n${srtTime(a)} --> ${srtTime(b)}\n${line}\n`);}t+=dur;}return out.join("\n");}
-
 function runFfmpeg(args,timeoutMs=300000){if(!ffmpegPath)throw new Error("ffmpeg-static binary unavailable");return new Promise((resolve,reject)=>{const c=spawn(ffmpegPath,args,{stdio:["ignore","ignore","pipe"]});let err="";const timer=setTimeout(()=>{c.kill("SIGKILL");reject(new Error("FFMPEG_TIMEOUT"));},timeoutMs);c.stderr.on("data",d=>{err+=d.toString();if(err.length>10000)err=err.slice(-10000);});c.on("error",e=>{clearTimeout(timer);reject(e);});c.on("close",code=>{clearTimeout(timer);code===0?resolve():reject(new Error(`FFmpeg failed (${code}): ${err.slice(-2500)}`));});});}
-
 async function getPersistedMedia(jobId){const r=await db(`SELECT kind,data,mime_type FROM job_media WHERE job_id=$1 AND kind IN ('video','thumbnail','captions')`,[jobId]);const m={};for(const x of r.rows)m[x.kind]={data:Buffer.from(x.data),mimeType:x.mime_type};return m;}
-
 async function saveMedia(jobId,kind,data,mimeType){const b=Buffer.from(data),sha=crypto.createHash("sha256").update(b).digest("hex");await db(`INSERT INTO job_media(job_id,kind,data,mime_type,sha256) VALUES($1,$2,$3,$4,$5) ON CONFLICT(job_id,kind) DO UPDATE SET data=EXCLUDED.data,mime_type=EXCLUDED.mime_type,sha256=EXCLUDED.sha256,updated_at=NOW()`,[jobId,kind,b,mimeType,sha]);}
-
 async function buildVideoPackage(job,audio,chunks){const existing=await getPersistedMedia(job.id);if(existing.video&&existing.thumbnail&&existing.captions)return existing;const dir=await fs.mkdtemp(path.join(os.tmpdir(),`yt-${job.id}-`)),audioPath=path.join(dir,"audio.wav"),srtPath=path.join(dir,"captions.srt"),videoPath=path.join(dir,"video.mp4"),thumbPath=path.join(dir,"thumbnail.jpg");try{const rows=await db(`SELECT audio_data FROM job_audio_chunks WHERE job_id=$1 AND status='completed' ORDER BY chunk_index`,[job.id]),buffers=rows.rows.map(r=>Buffer.from(r.audio_data)),srt=makeSrt(chunks,buffers);await fs.writeFile(audioPath,audio);await fs.writeFile(srtPath,srt);const dur=Math.max(1,wavDurationSeconds(audio));await runFfmpeg(["-y","-f","lavfi","-i","color=c=black:s=640x360:r=10","-i",audioPath,"-t",String(dur),"-c:v","libx264","-preset","ultrafast","-tune","stillimage","-crf","38","-pix_fmt","yuv420p","-c:a","aac","-b:a","64k",videoPath]);const video=await fs.readFile(videoPath);if(video.length>49*1024*1024)throw new Error(`Final video is too large for Telegram: ${(video.length/1048576).toFixed(1)}MB`);await runFfmpeg(["-y","-i",videoPath,"-frames:v","1","-q:v","5",thumbPath]);const thumb=await fs.readFile(thumbPath),cap=Buffer.from(srt,"utf8");await saveMedia(job.id,"video",video,"video/mp4");await saveMedia(job.id,"thumbnail",thumb,"image/jpeg");await saveMedia(job.id,"captions",cap,"application/x-subrip");return{video:{data:video,mimeType:"video/mp4"},thumbnail:{data:thumb,mimeType:"image/jpeg"},captions:{data:cap,mimeType:"application/x-subrip"}};}finally{await fs.rm(dir,{recursive:true,force:true}).catch(()=>{});}}
 
 const jobQueue = new Map();
@@ -1379,73 +1488,60 @@ async function runJobOnce(id,chatId=null){const claim=await db(`UPDATE jobs SET 
 
 async function createJob(topic, chatId) {
   const id =
-    `job_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    `job_${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
 
-  // IMPORTANT:
-  // Telegram chat_id is saved with the job.
-  // This prevents the previous NOT NULL error
-  // and allows safe resume after restart.
-
-  await db(
-    `
-    INSERT INTO jobs
-      (
-        id,
-        topic,
-        chat_id,
-        status,
-        progress,
-        stage
-      )
-    VALUES
-      (
-        $1,
-        $2,
-        $3,
-        'queued',
-        0,
-        'queued'
-      )
-    `,
-    [
-      id,
-      topic,
-      chatId,
-    ]
-  );
-
-  sendMessage(
-    chatId,
-    `🎬 JOB CREATED\n\nTopic: ${topic}\n\nJob ID: ${id}`
-  ).catch(() => {});
-
-  setImmediate(() => processJob(
-    id,
-    chatId
-  ).catch(async (error) => {
-    console.error(
-      "Background job error:",
-      error
+  try {
+    await db(
+      `
+        INSERT INTO jobs (
+          id,
+          topic,
+          chat_id,
+          status,
+          progress,
+          stage
+        )
+        VALUES ($1, $2, $3, 'queued', 0, 'queued')
+      `,
+      [id, topic, chatId]
     );
-
-    await updateJob(
-      id,
-      {
-        status: "paused",
-        error: error.message,
-      }
-    ).catch(() => {});
+  } catch (error) {
+    console.error(`Create job ${id} failed:`, error);
 
     await sendMessage(
       chatId,
-      `⏸️ JOB PAUSED SAFELY
-
-Reason: ${error.message}
-
-Resume with:
-/resume ${id}`
+      `❌ JOB CREATE FAILED\n\n${error.message}`
     ).catch(() => {});
-  }));
+
+    return null;
+  }
+
+  // Telegram gets the acknowledgement immediately; the heavy pipeline is
+  // started asynchronously and does not block the webhook request.
+  await sendMessage(
+    chatId,
+    `🎬 JOB CREATED\n\nTopic: ${topic}\n\nJob ID: ${id}\n\n⏳ Processing started in background.`
+  ).catch(() => {});
+
+  setImmediate(() => {
+    processJob(id, chatId).catch(async (error) => {
+      console.error(
+        `Background job error for ${id}:`,
+        error
+      );
+
+      await updateJob(id, {
+        status: 'paused',
+        error: error.message,
+      }).catch(() => {});
+
+      await sendMessage(
+        chatId,
+        `⏸️ JOB PAUSED SAFELY\n\nReason: ${error.message}\n\nResume with:
+/resume ${id}`
+      ).catch(() => {});
+    });
+  });
 
   return id;
 }
@@ -1581,12 +1677,13 @@ Example:
       ===================== */
 
       if (
+        text === "/create" ||
         text.startsWith("/create ")
       ) {
 
         const topic =
           text
-            .substring(8)
+            .substring(7)
             .trim();
 
         if (!topic) {
@@ -1612,6 +1709,7 @@ Example:
       ===================== */
 
       if (
+        text === "/resume" ||
         text.startsWith("/resume ")
       ) {
 
@@ -1660,9 +1758,7 @@ Use:
         "Webhook processing error:",
         error
       );
-
     }
-
   }
 );
 
@@ -1716,8 +1812,10 @@ async function startup() {
       };
 
       if (WEBHOOK_SECRET) {
+
         webhookBody.secret_token =
           WEBHOOK_SECRET;
+
       }
 
       await telegram(
@@ -1815,7 +1913,6 @@ process.on(
       .catch(() => {});
 
     process.exit(0);
-
   }
 );
 
@@ -1828,7 +1925,6 @@ process.on(
       .catch(() => {});
 
     process.exit(0);
-
   }
 );
 
