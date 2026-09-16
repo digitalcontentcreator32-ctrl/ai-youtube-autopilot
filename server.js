@@ -33,12 +33,37 @@ const SCRIPT_MODELS = [
   "gemini-3.5-flash",
   "gemini-2.5-flash",
 ];
+const TARGET_SCRIPT_WORDS = {
+  min: 750,
+  max: 900,
+};
 
 const sleep = (ms) =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 async function db(query, params = []) {
   return pool.query(query, params);
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error.name === "AbortError") {
+      const timeoutError = new Error(`REQUEST_TIMEOUT_${timeoutMs}MS`);
+      timeoutError.code = "TIMEOUT";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /* =========================
@@ -176,6 +201,25 @@ async function initDatabase() {
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       PRIMARY KEY (job_id, chunk_index)
     )
+  `);
+  await db(`
+    CREATE INDEX IF NOT EXISTS jobs_chat_updated_idx
+    ON jobs(chat_id, updated_at DESC)
+  `);
+
+  await db(`
+    CREATE INDEX IF NOT EXISTS jobs_queue_idx
+    ON jobs(status, created_at)
+  `);
+
+  await db(`
+    CREATE INDEX IF NOT EXISTS job_audio_chunks_status_idx
+    ON job_audio_chunks(job_id, status, chunk_index)
+  `);
+
+  await db(`
+    CREATE INDEX IF NOT EXISTS job_media_kind_idx
+    ON job_media(job_id, kind)
   `);
 
   await db(`
@@ -331,7 +375,7 @@ async function telegram(
     );
   }
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
     {
       method: "POST",
@@ -340,7 +384,8 @@ async function telegram(
           "application/json",
       },
       body: JSON.stringify(body),
-    }
+    },
+    15000
   );
 
   const raw =
@@ -415,12 +460,13 @@ async function sendDocument(
   }
 
   const response =
-    await fetch(
+    await fetchWithTimeout(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`,
       {
         method: "POST",
         body: form,
-      }
+      },
+      30000
     );
 
   const data =
@@ -430,6 +476,38 @@ async function sendDocument(
     throw new Error(
       `Telegram document error: ${JSON.stringify(data)}`
     );
+  }
+
+  return data.result;
+}
+
+async function sendVideo(
+  chatId,
+  buffer,
+  filename,
+  caption = ""
+) {
+  if (!chatId) return;
+
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append(
+    "video",
+    new Blob([buffer], { type: "video/mp4" }),
+    filename
+  );
+
+  if (caption) form.append("caption", caption);
+
+  const response = await fetchWithTimeout(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo`,
+    { method: "POST", body: form },
+    60000
+  );
+  const data = await response.json();
+
+  if (!data.ok) {
+    throw new Error(`Telegram video error: ${JSON.stringify(data)}`);
   }
 
   return data.result;
@@ -586,8 +664,8 @@ async function generateScript(
 
   const lengthRule =
     threeFacts
-      ? "- For a request asking for 3 facts, target about 300-380 words total."
-      : "- For other requests, keep the narration concise and avoid unnecessary length.";
+      ? "- Even for 3 facts, target 750-850 words by explaining each fact with useful context."
+      : "- Target 750-900 words so the narration runs approximately 5-6 minutes at a natural Hindi speaking pace.";
 
   const prompt = `
 Create an original YouTube narration script about:
@@ -604,6 +682,7 @@ Requirements:
 ${lengthRule}
 - Natural spoken narration.
 - No stage directions.
+- Return only the narration, with no title, markdown, or commentary.
 `;
 
   let lastError;
@@ -628,7 +707,7 @@ ${lengthRule}
             ],
             generationConfig: {
               temperature: 0.8,
-              maxOutputTokens: 3000,
+              maxOutputTokens: 5000,
             },
           },
           45000,
@@ -683,9 +762,12 @@ function qualityCheck(
       .split(/\s+/)
       .filter(Boolean);
 
-  if (words.length < 150) {
+  if (
+    words.length < TARGET_SCRIPT_WORDS.min ||
+    words.length > TARGET_SCRIPT_WORDS.max
+  ) {
     throw new Error(
-      "Script too short for quality gate"
+      `Script must contain ${TARGET_SCRIPT_WORDS.min}-${TARGET_SCRIPT_WORDS.max} words; received ${words.length}`
     );
   }
 
@@ -790,6 +872,7 @@ const ELEVENLABS_API_KEY =
   process.env.ELEVENLABS_API_KEY;
 
 const ELEVENLABS_MODEL_ID =
+  process.env.ELEVENLABS_MODEL_ID ||
   "eleven_flash_v2_5";
 
 const ELEVENLABS_HINDI_VOICE_ID =
@@ -865,9 +948,9 @@ async function googleAccessToken() {
     !credentials?.client_email ||
     !credentials?.private_key
   ) {
-    throw new Error(
-      "Google Cloud TTS credentials missing"
-    );
+    const error = new Error("Google Cloud TTS credentials missing");
+    error.code = "CONFIGURATION";
+    throw error;
   }
 
   const now =
@@ -916,23 +999,21 @@ async function googleAccessToken() {
   const assertion =
     `${unsigned}.${base64Url(signature)}`;
 
-  const response =
-    await fetch(
-      "https://oauth2.googleapis.com/token",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type":
-            "application/x-www-form-urlencoded",
-        },
-        body:
-          new URLSearchParams({
-            grant_type:
-              "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            assertion,
-          }),
-      }
-    );
+  const response = await fetchWithTimeout(
+    "https://oauth2.googleapis.com/token",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type:
+          "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        assertion,
+      }),
+    },
+    15000
+  );
 
   const raw =
     await response.text();
@@ -959,9 +1040,9 @@ async function elevenLabsTTS(
   text
 ) {
   if (!ELEVENLABS_API_KEY) {
-    throw new Error(
-      "ELEVENLABS_API_KEY missing"
-    );
+    const error = new Error("ELEVENLABS_API_KEY missing");
+    error.code = "CONFIGURATION";
+    throw error;
   }
 
   const clean =
@@ -983,49 +1064,31 @@ async function elevenLabsTTS(
       : ELEVENLABS_ENGLISH_VOICE_ID;
 
   if (!voiceId) {
-    throw new Error(
+    const error = new Error(
       `ElevenLabs ${hindi ? "Hindi" : "English"} voice ID missing`
     );
+    error.code = "CONFIGURATION";
+    throw error;
   }
 
-  const controller =
-    new AbortController();
-
-  const timer =
-    setTimeout(
-      () =>
-        controller.abort(),
-      90000
-    );
-
   try {
-    const response =
-      await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
-          voiceId
-        )}`,
-        {
-          method: "POST",
-          headers: {
-            "xi-api-key":
-              ELEVENLABS_API_KEY,
-            "Content-Type":
-              "application/json",
-            Accept:
-              "audio/pcm",
-          },
-          body:
-            JSON.stringify({
-              text: clean,
-              model_id:
-                ELEVENLABS_MODEL_ID,
-              output_format:
-                "pcm_16000",
-            }),
-          signal:
-            controller.signal,
-        }
-      );
+    const response = await fetchWithTimeout(
+      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
+          Accept: "audio/pcm",
+        },
+        body: JSON.stringify({
+          text: clean,
+          model_id: ELEVENLABS_MODEL_ID,
+          output_format: "pcm_16000",
+        }),
+      },
+      30000
+    );
 
     const rawBuffer =
       Buffer.from(
@@ -1067,24 +1130,7 @@ async function elevenLabsTTS(
         "elevenlabs",
     };
   } catch (error) {
-    if (
-      error.name ===
-      "AbortError"
-    ) {
-      const timeoutError =
-        new Error(
-          "ELEVENLABS_TTS_TIMEOUT_90000MS"
-        );
-
-      timeoutError.code =
-        "TIMEOUT";
-
-      throw timeoutError;
-    }
-
     throw error;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -1117,35 +1163,25 @@ async function googleCloudTTS(
       ? GOOGLE_TTS_HI_VOICE_NAME
       : GOOGLE_TTS_EN_VOICE_NAME;
 
-  const response =
-    await fetch(
-      "https://texttospeech.googleapis.com/v1/text:synthesize",
-      {
-        method: "POST",
-        headers: {
-          Authorization:
-            `Bearer ${token}`,
-          "Content-Type":
-            "application/json",
+  const response = await fetchWithTimeout(
+    "https://texttospeech.googleapis.com/v1/text:synthesize",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        input: { text: clean },
+        voice: { languageCode, name },
+        audioConfig: {
+          audioEncoding: "LINEAR16",
+          speakingRate: 1.0,
         },
-        body:
-          JSON.stringify({
-            input: {
-              text: clean,
-            },
-            voice: {
-              languageCode,
-              name,
-            },
-            audioConfig: {
-              audioEncoding:
-                "LINEAR16",
-              speakingRate:
-                1.0,
-            },
-          }),
-      }
-    );
+      }),
+    },
+    30000
+  );
 
   const raw =
     await response.text();
@@ -1352,18 +1388,20 @@ async function generateTTSWithRetry(
         }));
 
         const retryable =
-          error.code === "TIMEOUT" ||
-          !status ||
+          error.code !== "CONFIGURATION" &&
+          !isContentBlockedError(error) &&
+          (error.code === "TIMEOUT" ||
+          error.name === "TypeError" ||
           status === 408 ||
           status === 425 ||
           status === 429 ||
-          status >= 500;
+          status >= 500);
 
         if (!retryable || attempt === 3) break;
 
         const wait = Math.min(
-          30000,
-          Number(error.retryAfterMs) || 1500 * (2 ** (attempt - 1))
+          8000,
+          Number(error.retryAfterMs) || 750 * (2 ** (attempt - 1))
         );
         await sleep(wait + Math.floor(Math.random() * 500));
       }
@@ -1465,39 +1503,7 @@ async function normalizeAudioResult(result) {
 }
 
 async function generateChunkAudio(text, chunkIndex) {
-  try {
-    return await generateTTSWithRetry(text, chunkIndex);
-  } catch (error) {
-    const words = String(text).trim().split(/\s+/).filter(Boolean);
-
-    if (words.length < 40) {
-      throw error;
-    }
-
-    const midpoint = Math.ceil(words.length / 2);
-    const parts = [
-      words.slice(0, midpoint).join(" "),
-      words.slice(midpoint).join(" "),
-    ];
-
-    console.log(JSON.stringify({
-      event: "tts_chunk_split",
-      chunk: chunkIndex,
-      words: words.length,
-    }));
-
-    const results = [];
-    for (let part = 0; part < parts.length; part++) {
-      results.push(await generateChunkAudio(`${parts[part]}`, `${chunkIndex}.${part + 1}`));
-    }
-
-    return {
-      buffer: concatWavBuffers(results.map((item) => item.buffer)),
-      mimeType: "audio/wav",
-      model: results.map((item) => item.model).join(","),
-      provider: results.map((item) => item.provider).join(","),
-    };
-  }
+  return generateTTSWithRetry(text, chunkIndex);
 }
 
 /* =========================
@@ -2175,11 +2181,24 @@ function srtTime(
 
 function makeSrt(
   chunks,
-  audioBuffers
+  audioBuffers,
+  title = ""
 ) {
   let t = 0;
   let n = 1;
   const out = [];
+
+  const cleanTitle = String(title || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (cleanTitle) {
+    out.push(
+      `${n++}\n` +
+      `${srtTime(0)} --> ${srtTime(Math.min(4, wavDurationSeconds(audioBuffers[0])))}\n` +
+      `${cleanTitle}\n`
+    );
+  }
 
   for (
     let i = 0;
@@ -2236,6 +2255,126 @@ function makeSrt(
   }
 
   return out.join("\n");
+}
+
+function escapeFilterPath(filePath) {
+  return filePath
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\'");
+}
+
+async function buildSceneVideo({
+  dir,
+  chunks,
+  audioPath,
+  videoPath,
+  durations,
+  captionsPath,
+}) {
+  const colors = [
+    "0x102a43",
+    "0x1f3a5f",
+    "0x164e63",
+    "0x365314",
+    "0x713f12",
+    "0x4c1d95",
+  ];
+  const sceneInputs = [];
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    sceneInputs.push(
+      "-f",
+      "lavfi",
+      "-t",
+      String(Math.max(0.2, durations[i])),
+      "-i",
+      `color=c=${colors[i % colors.length]}:s=1080x1920:r=30`
+    );
+  }
+
+  const transition = 0.45;
+  const filters = [];
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    filters.push(
+      `[${i}:v]setpts=PTS-STARTPTS,fps=30,drawbox=x=55:y=180:w=970:h=1560:color=white@0.08:t=4[v${i}]`
+    );
+  }
+
+  let videoLabel = "v0";
+  let accumulated = durations[0];
+
+  for (let i = 1; i < chunks.length; i += 1) {
+    const nextLabel = `vx${i}`;
+    const offset = Math.max(0, accumulated - transition);
+    filters.push(
+      `[${videoLabel}][v${i}]xfade=transition=fade:duration=${transition}:offset=${offset}[${nextLabel}]`
+    );
+    videoLabel = nextLabel;
+    accumulated += durations[i] - transition;
+  }
+
+  const audioIndex = chunks.length;
+  const musicPath = process.env.BACKGROUND_MUSIC_PATH;
+  let musicEnabled = false;
+
+  if (musicPath) {
+    try {
+      await fs.access(musicPath);
+      musicEnabled = true;
+    } catch {
+      console.warn("Configured BACKGROUND_MUSIC_PATH is unavailable; continuing without music");
+    }
+  }
+
+  const args = ["-y", ...sceneInputs, "-i", audioPath];
+
+  if (musicEnabled) {
+    args.push("-stream_loop", "-1", "-i", musicPath);
+  }
+
+  const audioFilters = musicEnabled
+    ? `[${audioIndex}:a]aresample=24000,volume=0.10[music];[${audioIndex}:a][music]amix=inputs=2:duration=first:dropout_transition=2[aout]`
+    : `[${audioIndex}:a]aresample=24000,volume=1.0[aout]`;
+
+  filters.push(
+    `[${videoLabel}]subtitles=${escapeFilterPath(captionsPath)}:force_style='FontName=DejaVu Sans,FontSize=18,Alignment=2,MarginV=120,Outline=2,Shadow=1',format=yuv420p[vout]`,
+    audioFilters
+  );
+
+  args.push(
+    "-filter_complex",
+    filters.join(";"),
+    "-map",
+    "[vout]",
+    "-map",
+    "[aout]",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "fast",
+    "-crf",
+    "25",
+    "-r",
+    "30",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-ar",
+    "24000",
+    "-ac",
+    "1",
+    "-movflags",
+    "+faststart",
+    "-shortest",
+    videoPath
+  );
+
+  await runFfmpeg(args, 600000);
 }
 
 function runFfmpeg(
@@ -2493,11 +2632,7 @@ async function buildVideoPackage(
           )
       );
 
-    const srt =
-      makeSrt(
-        chunks,
-        buffers
-      );
+    const srt = makeSrt(chunks, buffers, job.topic);
 
     await fs.writeFile(
       audioPath,
@@ -2517,32 +2652,16 @@ async function buildVideoPackage(
         )
       );
 
-    await runFfmpeg([
-      "-y",
-      "-f",
-      "lavfi",
-      "-i",
-      "color=c=black:s=640x360:r=10",
-      "-i",
+    const durations = buffers.map(wavDurationSeconds);
+
+    await buildSceneVideo({
+      dir,
+      chunks,
       audioPath,
-      "-t",
-      String(dur),
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-tune",
-      "stillimage",
-      "-crf",
-      "38",
-      "-pix_fmt",
-      "yuv420p",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "64k",
       videoPath,
-    ]);
+      durations,
+      captionsPath: srtPath,
+    });
 
     const video =
       await fs.readFile(
@@ -2636,8 +2755,12 @@ async function buildVideoPackage(
 const jobQueue =
   new Map();
 
-let queuePumpRunning =
-  false;
+const MAX_ACTIVE_JOBS = Math.max(
+  1,
+  Math.min(3, Number(process.env.JOB_CONCURRENCY) || 2)
+);
+let activeJobs = 0;
+let queuePumpRunning = false;
 
 function processJob(
   id,
@@ -2670,6 +2793,28 @@ function processJob(
   );
 }
 
+function userFacingError(error) {
+  const message = String(error?.message || "Unknown processing error");
+
+  if (message.includes("missing")) {
+    return "A required provider configuration is missing. Check the server configuration.";
+  }
+
+  if (Number(error?.status) === 401 || Number(error?.status) === 403) {
+    return "A configured provider rejected authentication or permissions. Check the server configuration.";
+  }
+
+  if (message.includes("TIMEOUT") || error?.code === "TIMEOUT") {
+    return "A provider timed out. Completed work was saved; you can resume this job.";
+  }
+
+  if (message.includes("FFmpeg")) {
+    return "Video rendering failed. Completed work was saved; you can resume this job.";
+  }
+
+  return "The job paused safely. Completed work was saved; you can resume it.";
+}
+
 async function pumpJobQueue() {
   if (
     queuePumpRunning
@@ -2681,9 +2826,7 @@ async function pumpJobQueue() {
     true;
 
   try {
-    while (
-      jobQueue.size > 0
-    ) {
+    while (jobQueue.size > 0 && activeJobs < MAX_ACTIVE_JOBS) {
       const item =
         jobQueue
           .values()
@@ -2694,35 +2837,22 @@ async function pumpJobQueue() {
         item.id
       );
 
-      try {
-        await runJobOnce(
-          item.id,
-          item.chatId
-        );
-      } catch (error) {
-        console.error(
-          `Unhandled worker error for ${item.id}:`,
-          error
-        );
-      }
+      activeJobs += 1;
+      runJobOnce(item.id, item.chatId)
+        .catch((error) => {
+          console.error(`Unhandled worker error for ${item.id}:`, error);
+        })
+        .finally(() => {
+          activeJobs -= 1;
+          pumpJobQueue().catch((error) => {
+            console.error("Job queue restart failed:", error);
+          });
+        });
     }
   } finally {
     queuePumpRunning =
       false;
 
-    if (
-      jobQueue.size > 0
-    ) {
-      pumpJobQueue()
-        .catch(
-          (error) => {
-            console.error(
-              "Job queue restart failed:",
-              error
-            );
-          }
-        );
-    }
   }
 }
 
@@ -2862,11 +2992,10 @@ async function runJobOnce(
       "📦 Video package ready\nProgress: 95%"
     );
 
-    await sendDocument(
+    await sendVideo(
       targetChat,
       media.video.data,
       `${id}.mp4`,
-      "video/mp4",
       `🎬 AI YouTube video completed\nJob: ${id}`
     );
 
@@ -2922,7 +3051,7 @@ async function runJobOnce(
 
     await sendMessage(
       targetChat,
-      `⏸️ JOB PAUSED SAFELY\n\nReason: ${error.message}\n\nCompleted TTS/media are saved.\nResume with:\n/resume ${id}`
+      `⏸️ JOB PAUSED SAFELY\n\n${userFacingError(error)}\n\nResume with:\n/resume ${id}`
     ).catch(() => {});
 
     return false;
@@ -2997,7 +3126,7 @@ async function createJob(
 
           await sendMessage(
             chatId,
-            `⏸️ JOB PAUSED SAFELY\n\nReason: ${error.message}\n\nResume with:\n/resume ${id}`
+            `⏸️ JOB PAUSED SAFELY\n\n${userFacingError(error)}\n\nResume with:\n/resume ${id}`
           ).catch(() => {});
         }
       )
@@ -3184,6 +3313,38 @@ Payment mode: APPROVAL ONLY`
   );
 }
 
+async function jobStatus(id, chatId) {
+  const job = await getJob(id);
+
+  if (!job) {
+    await sendMessage(chatId, "❌ Job not found. Check the job ID and try again.");
+    return;
+  }
+
+  if (String(job.chat_id) !== String(chatId)) {
+    await sendMessage(chatId, "❌ This job belongs to another chat.");
+    return;
+  }
+
+  const chunks = job.tts_total_chunks
+    ? `${job.tts_completed_chunks || 0}/${job.tts_total_chunks}`
+    : "not started";
+
+  await sendMessage(
+    chatId,
+    `Job ${job.id}\nStatus: ${job.status}\nStage: ${job.stage}\nProgress: ${job.progress}%\nTTS chunks: ${chunks}${job.error ? `\nLast error: ${userFacingError({ message: job.error })}` : ""}`
+  );
+}
+
+const HELP_TEXT = `🤖 AI YouTube Autopilot
+
+/start - show the bot welcome message
+/create <topic> - create a 5-6 minute educational video
+/status - show your job summary
+/status <job_id> - show one of your job's progress
+/resume <job_id> - continue a paused job
+/help - show this command list`;
+
 /* =========================
    TELEGRAM WEBHOOK
 ========================= */
@@ -3253,11 +3414,19 @@ app.post(
       const text =
         message.text.trim();
 
+      const firstSpace = text.search(/\s/);
+      const rawCommand = firstSpace === -1
+        ? text
+        : text.slice(0, firstSpace);
+      const command = rawCommand.split("@")[0].toLowerCase();
+      const argument = firstSpace === -1
+        ? ""
+        : text.slice(firstSpace).trim();
+
       /* /start */
 
       if (
-        text ===
-        "/start"
+        command === "/start"
       ) {
         await sendMessage(
           chatId,
@@ -3265,13 +3434,7 @@ app.post(
 
 ONLINE ✅
 
-Commands:
-
-/create <topic>
-
-/status
-
-/resume <job_id>
+${HELP_TEXT}
 
 Example:
 
@@ -3281,30 +3444,29 @@ Example:
         return;
       }
 
+      /* /help */
+
+      if (command === "/help") {
+        await sendMessage(chatId, HELP_TEXT);
+        return;
+      }
+
       /* /status */
 
-      if (
-        text ===
-        "/status"
-      ) {
-        await status(
-          chatId
-        );
+      if (command === "/status") {
+        if (argument) {
+          await jobStatus(argument, chatId);
+        } else {
+          await status(chatId);
+        }
 
         return;
       }
 
       /* /create */
 
-      if (
-        text.startsWith(
-          "/create "
-        )
-      ) {
-        const topic =
-          text
-            .substring(8)
-            .trim();
+      if (command === "/create") {
+        const topic = argument;
 
         if (!topic) {
           await sendMessage(
@@ -3325,15 +3487,8 @@ Example:
 
       /* /resume */
 
-      if (
-        text.startsWith(
-          "/resume "
-        )
-      ) {
-        const id =
-          text
-            .substring(8)
-            .trim();
+      if (command === "/resume") {
+        const id = argument;
 
         if (!id) {
           await sendMessage(
@@ -3358,12 +3513,7 @@ Example:
         chatId,
         `Unknown command.
 
-Use:
-
-/start
-/create <topic>
-/status
-/resume <job_id>`
+${HELP_TEXT}`
       );
     } catch (error) {
       console.error(
