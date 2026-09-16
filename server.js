@@ -1,7 +1,7 @@
 import express from "express";
 import pg from "pg";
+import textToSpeech from "@google-cloud/text-to-speech";
 import fs from "node:fs/promises";
-import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import ffmpegPath from "ffmpeg-static";
 
 const { Pool } = pg;
+const { TextToSpeechClient } = textToSpeech;
 const app = express();
 
 app.use(express.json({ limit: "2mb" }));
@@ -129,6 +130,257 @@ async function initDatabase() {
   `);
 
   await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_completed_chunks INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_current_chunk INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tts_chunk_size INTEGER DEFAULT 0
+  `);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS job_media (
+      job_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      data BYTEA NOT NULL,
+      mime_type TEXT NOT NULL,
+      sha256 TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (job_id, kind)
+    )
+  `);
+
+  await db(`
+    ALTER TABLE job_media
+    ADD COLUMN IF NOT EXISTS sha256 TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_media
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    ALTER TABLE job_media
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    ALTER TABLE job_media
+    ADD COLUMN IF NOT EXISTS data BYTEA
+  `);
+
+  await db(`
+    ALTER TABLE job_media
+    ADD COLUMN IF NOT EXISTS mime_type TEXT
+  `);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS telegram_updates (
+      update_id BIGINT PRIMARY KEY,
+      received_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS job_audio_chunks (
+      job_id TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      audio_data BYTEA,
+      mime_type TEXT,
+      status TEXT DEFAULT 'pending',
+      model TEXT,
+      error TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (job_id, chunk_index)
+    )
+  `);
+
+  await db(`
+    CREATE INDEX IF NOT EXISTS jobs_chat_updated_idx
+    ON jobs(chat_id, updated_at DESC)
+  `);
+
+  await db(`
+    CREATE INDEX IF NOT EXISTS jobs_queue_idx
+    ON jobs(status, created_at)
+  `);
+
+  await db(`
+    CREATE INDEX IF NOT EXISTS job_audio_chunks_status_idx
+    ON job_audio_chunks(job_id, status, chunk_index)
+  `);
+
+  await db(`
+    CREATE INDEX IF NOT EXISTS job_media_kind_idx
+    ON job_media(job_id, kind)
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS job_id TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS chunk_index INTEGER
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS audio_data BYTEA
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS mime_type TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS model TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS error TEXT
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    ALTER TABLE job_audio_chunks
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await db(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'job_audio_chunks'
+          AND column_name = 'audio'
+      ) THEN
+        UPDATE job_audio_chunks
+        SET audio_data = audio
+        WHERE audio_data IS NULL AND audio IS NOT NULL;
+      END IF;
+    END $$;
+  `);
+
+  await db(`
+    UPDATE jobs
+    SET
+      tts_total_chunks = COALESCE(tts_total_chunks, 0),
+      tts_completed_chunks = COALESCE(tts_completed_chunks, 0),
+      tts_current_chunk = COALESCE(tts_current_chunk, 0),
+      progress = COALESCE(progress, 0),
+      stage = COALESCE(stage, 'queued'),
+      status = COALESCE(status, 'queued'),
+      updated_at = COALESCE(updated_at, NOW())
+  `);
+
+  await db(`
+    UPDATE job_audio_chunks
+    SET
+      status = COALESCE(status, 'pending'),
+      created_at = COALESCE(created_at, NOW()),
+      updated_at = COALESCE(updated_at, NOW())
+  `);
+
+  const check = await db(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'job_audio_chunks'
+    ORDER BY ordinal_position
+  `);
+
+  const columns = check.rows.map((row) => row.column_name);
+  const required = [
+    "job_id",
+    "chunk_index",
+    "audio_data",
+    "mime_type",
+    "status",
+    "model",
+    "error",
+    "created_at",
+    "updated_at",
+  ];
+  const missing = required.filter((column) => !columns.includes(column));
+
+  if (missing.length > 0) {
+    throw new Error(
+      `DATABASE MIGRATION FAILED. Missing job_audio_chunks columns: ${missing.join(", ")}`
+    );
+  }
+
+  console.log("job_audio_chunks schema verified:", columns.join(", "));
+  console.log("PostgreSQL database initialized and migrations checked");
+}
+
+/* =========================
+   TELEGRAM
+========================= */
+
+async function telegram(
+  method,
+  body = {}
+) {
+  if (!TELEGRAM_BOT_TOKEN) {
+    throw new Error(
+      "TELEGRAM_BOT_TOKEN missing"
+    );
+  }
+
+  const response = await fetchWithTimeout(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    },
+    15000
+  );
+
+  const raw = await response.text();
+  let data;
+
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`Telegram invalid response: ${raw}`);
+  }
+
+  if (!data.ok) {
+    throw new Error(`Telegram API error: ${raw}`);
+  }
+
+  return data.result;
+}
+
+/*
     ALTER TABLE jobs
     ADD COLUMN IF NOT EXISTS tts_completed_chunks INTEGER DEFAULT 0
   `);
@@ -361,10 +613,6 @@ async function initDatabase() {
   );
 }
 
-/* =========================
-   TELEGRAM
-========================= */
-
 async function telegram(
   method,
   body = {}
@@ -409,6 +657,7 @@ async function telegram(
 
   return data.result;
 }
+
 
 async function sendMessage(
   chatId,
@@ -513,8 +762,10 @@ async function sendVideo(
   return data.result;
 }
 
+*/
+
 /* =========================
-   GEMINI REST
+  GEMINI REST
 ========================= */
 
 async function geminiRequest(
@@ -864,22 +1115,8 @@ function splitIntoChunks(
 
 /* =========================
    TTS
-   ELEVENLABS PRIMARY
-   GOOGLE CLOUD FALLBACK
+   GOOGLE CLOUD PRIMARY
 ========================= */
-
-const ELEVENLABS_API_KEY =
-  process.env.ELEVENLABS_API_KEY;
-
-const ELEVENLABS_MODEL_ID =
-  process.env.ELEVENLABS_MODEL_ID ||
-  "eleven_flash_v2_5";
-
-const ELEVENLABS_HINDI_VOICE_ID =
-  process.env.ELEVENLABS_HINDI_VOICE_ID;
-
-const ELEVENLABS_ENGLISH_VOICE_ID =
-  process.env.ELEVENLABS_ENGLISH_VOICE_ID;
 
 const GOOGLE_TTS_HI_VOICE_NAME =
   process.env.GOOGLE_TTS_HI_VOICE_NAME ||
@@ -889,13 +1126,11 @@ const GOOGLE_TTS_EN_VOICE_NAME =
   process.env.GOOGLE_TTS_EN_VOICE_NAME ||
   "en-US-Neural2-J";
 
-const GOOGLE_TTS_SERVICE_ACCOUNT_JSON =
-  process.env.GOOGLE_TTS_SERVICE_ACCOUNT_JSON ||
+const GOOGLE_APPLICATION_CREDENTIALS_JSON =
+  process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON ||
   "";
 
-const GOOGLE_TTS_SERVICE_ACCOUNT_FILE =
-  process.env.GOOGLE_TTS_SERVICE_ACCOUNT_FILE ||
-  "/etc/secrets/google-tts.json";
+let googleTtsClient;
 
 function isHindiText(text) {
   return /[\u0900-\u097F]/.test(
@@ -903,336 +1138,109 @@ function isHindiText(text) {
   );
 }
 
-function base64Url(value) {
-  return Buffer
-    .from(value)
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-}
+function googleCredentialsFromEnvironment() {
+  if (!GOOGLE_APPLICATION_CREDENTIALS_JSON.trim()) return null;
 
-function loadGoogleServiceAccount() {
-  if (
-    GOOGLE_TTS_SERVICE_ACCOUNT_JSON.trim()
-  ) {
-    try {
-      return JSON.parse(
-        GOOGLE_TTS_SERVICE_ACCOUNT_JSON
-      );
-    } catch (error) {
-      throw new Error(
-        `Invalid GOOGLE_TTS_SERVICE_ACCOUNT_JSON: ${error.message}`
-      );
-    }
-  }
-
+  let credentials;
   try {
-    const raw =
-      readFileSync(
-        GOOGLE_TTS_SERVICE_ACCOUNT_FILE,
-        "utf8"
-      );
-
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-async function googleAccessToken() {
-  const credentials =
-    loadGoogleServiceAccount();
-
-  if (
-    !credentials?.client_email ||
-    !credentials?.private_key
-  ) {
-    const error = new Error("Google Cloud TTS credentials missing");
-    error.code = "CONFIGURATION";
-    throw error;
-  }
-
-  const now =
-    Math.floor(
-      Date.now() / 1000
-    );
-
-  const header =
-    base64Url(
-      JSON.stringify({
-        alg: "RS256",
-        typ: "JWT",
-      })
-    );
-
-  const claim =
-    base64Url(
-      JSON.stringify({
-        iss:
-          credentials.client_email,
-        scope:
-          "https://www.googleapis.com/auth/cloud-platform",
-        aud:
-          "https://oauth2.googleapis.com/token",
-        iat: now,
-        exp: now + 3600,
-      })
-    );
-
-  const unsigned =
-    `${header}.${claim}`;
-
-  const signer =
-    crypto.createSign(
-      "RSA-SHA256"
-    );
-
-  signer.update(unsigned);
-  signer.end();
-
-  const signature =
-    signer.sign(
-      credentials.private_key
-    );
-
-  const assertion =
-    `${unsigned}.${base64Url(signature)}`;
-
-  const response = await fetchWithTimeout(
-    "https://oauth2.googleapis.com/token",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({
-        grant_type:
-          "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        assertion,
-      }),
-    },
-    15000
-  );
-
-  const raw =
-    await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      `Google OAuth ${response.status}: ${raw}`
-    );
-  }
-
-  const data =
-    JSON.parse(raw);
-
-  if (!data.access_token) {
-    throw new Error(
-      "Google OAuth returned no access token"
-    );
-  }
-
-  return data.access_token;
-}
-
-async function elevenLabsTTS(
-  text
-) {
-  if (!ELEVENLABS_API_KEY) {
-    const error = new Error("ELEVENLABS_API_KEY missing");
-    error.code = "CONFIGURATION";
-    throw error;
-  }
-
-  const clean =
-    String(text || "")
-      .trim();
-
-  if (!clean) {
-    throw new Error(
-      "Empty ElevenLabs TTS text"
-    );
-  }
-
-  const hindi =
-    isHindiText(clean);
-
-  const voiceId =
-    hindi
-      ? ELEVENLABS_HINDI_VOICE_ID
-      : ELEVENLABS_ENGLISH_VOICE_ID;
-
-  if (!voiceId) {
-    const error = new Error(
-      `ElevenLabs ${hindi ? "Hindi" : "English"} voice ID missing`
-    );
-    error.code = "CONFIGURATION";
-    throw error;
-  }
-
-  try {
-    const response = await fetchWithTimeout(
-      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": ELEVENLABS_API_KEY,
-          "Content-Type": "application/json",
-          Accept: "audio/pcm",
-        },
-        body: JSON.stringify({
-          text: clean,
-          model_id: ELEVENLABS_MODEL_ID,
-          output_format: "pcm_16000",
-        }),
-      },
-      30000
-    );
-
-    const rawBuffer =
-      Buffer.from(
-        await response.arrayBuffer()
-      );
-
-    if (!response.ok) {
-      const detail =
-        rawBuffer
-          .toString("utf8")
-          .slice(0, 3000);
-
-      const error =
-        new Error(
-          `ElevenLabs ${response.status}: ${detail}`
-        );
-
-      error.status =
-        response.status;
-
-      throw error;
-    }
-
-    if (!rawBuffer.length) {
-      throw new Error(
-        "ElevenLabs returned empty audio"
-      );
-    }
-
-    return {
-      buffer: rawBuffer,
-      mimeType: "audio/pcm",
-      sampleRate: 16000,
-      channels: 1,
-      bits: 16,
-      model:
-        `elevenlabs:${ELEVENLABS_MODEL_ID}`,
-      provider:
-        "elevenlabs",
-    };
+    credentials = JSON.parse(GOOGLE_APPLICATION_CREDENTIALS_JSON);
   } catch (error) {
-    throw error;
+    const configurationError = new Error(
+      `Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: ${error.message}`
+    );
+    configurationError.code = "CONFIGURATION";
+    throw configurationError;
   }
+
+  if (!credentials?.client_email || !credentials?.private_key) {
+    const configurationError = new Error(
+      "GOOGLE_APPLICATION_CREDENTIALS_JSON must contain client_email and private_key"
+    );
+    configurationError.code = "CONFIGURATION";
+    throw configurationError;
+  }
+
+  return credentials;
+}
+
+function googleTtsCredentialsConfigured() {
+  return Boolean(
+    GOOGLE_APPLICATION_CREDENTIALS_JSON.trim() ||
+    process.env.GOOGLE_APPLICATION_CREDENTIALS ||
+    process.env.GOOGLE_CLOUD_PROJECT
+  );
+}
+
+function getGoogleTtsClient() {
+  if (googleTtsClient) return googleTtsClient;
+
+  const credentials = googleCredentialsFromEnvironment();
+  googleTtsClient = credentials
+    ? new TextToSpeechClient({ credentials })
+    : new TextToSpeechClient();
+
+  return googleTtsClient;
 }
 
 async function googleCloudTTS(
   text
 ) {
-  const clean =
-    String(text || "")
-      .trim();
+  const clean = String(text || "").trim();
+  if (!clean) throw new Error("Empty Google Cloud TTS text");
 
-  if (!clean) {
-    throw new Error(
-      "Empty Google Cloud TTS text"
-    );
-  }
+  const hindi = isHindiText(clean);
+  const languageCode = hindi ? "hi-IN" : "en-US";
+  const voiceName = hindi
+    ? GOOGLE_TTS_HI_VOICE_NAME
+    : GOOGLE_TTS_EN_VOICE_NAME;
 
-  const token =
-    await googleAccessToken();
-
-  const hindi =
-    isHindiText(clean);
-
-  const languageCode =
-    hindi
-      ? "hi-IN"
-      : "en-US";
-
-  const name =
-    hindi
-      ? GOOGLE_TTS_HI_VOICE_NAME
-      : GOOGLE_TTS_EN_VOICE_NAME;
-
-  const response = await fetchWithTimeout(
-    "https://texttospeech.googleapis.com/v1/text:synthesize",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+  try {
+    const [response] = await getGoogleTtsClient().synthesizeSpeech({
+      input: { text: clean },
+      voice: { languageCode, name: voiceName },
+      audioConfig: {
+        audioEncoding: "MP3",
+        speakingRate: 1.0,
       },
-      body: JSON.stringify({
-        input: { text: clean },
-        voice: { languageCode, name },
-        audioConfig: {
-          audioEncoding: "LINEAR16",
-          speakingRate: 1.0,
-        },
-      }),
-    },
-    30000
-  );
+    });
 
-  const raw =
-    await response.text();
+    const audioContent = response?.audioContent;
+    const buffer = Buffer.isBuffer(audioContent)
+      ? audioContent
+      : Buffer.from(audioContent || "");
 
-  if (!response.ok) {
-    const error =
-      new Error(
-        `Google Cloud TTS ${response.status}: ${raw}`
-      );
+    if (!buffer.length) {
+      const emptyError = new Error("Google Cloud TTS returned empty MP3 audio");
+      emptyError.code = "EMPTY_AUDIO";
+      throw emptyError;
+    }
 
-    error.status =
-      response.status;
-    error.retryAfterMs =
-      Number(response.headers.get("retry-after")) * 1000 || 0;
-
-    throw error;
-  }
-
-  const data =
-    JSON.parse(raw);
-
-  if (!data.audioContent) {
-    throw new Error(
-      "Google Cloud TTS returned no audioContent"
+    return {
+      buffer,
+      mimeType: "audio/mpeg",
+      model: `google-cloud:${voiceName}`,
+      provider: "google-cloud",
+    };
+  } catch (error) {
+    const wrapped = new Error(
+      `Google Cloud TTS failed${error?.code ? ` [code=${error.code}]` : ""}${error?.status ? ` [status=${error.status}]` : ""}: ${String(error?.message || "unknown error").slice(0, 500)}`
     );
+    wrapped.code = error?.code;
+    wrapped.status = error?.status;
+    wrapped.retryAfterMs = error?.retryAfterMs;
+    throw wrapped;
   }
+}
 
-  const buffer =
-    Buffer.from(
-      data.audioContent,
-      "base64"
-    );
-
-  if (!buffer.length) {
-    throw new Error(
-      "Google Cloud TTS returned empty audio"
-    );
+async function googleTtsSmokeTest() {
+  const result = await googleCloudTTS("यह एक छोटा हिंदी परीक्षण वाक्य है।");
+  if (!result.buffer?.length) {
+    throw new Error("Google Cloud TTS smoke test returned no audio");
   }
-
   return {
-    buffer,
-    mimeType:
-      "audio/pcm",
-    sampleRate:
-      24000,
-    channels: 1,
-    bits: 16,
-    model:
-      `google-cloud:${name}`,
-    provider:
-      "google-cloud",
+    provider: result.provider,
+    bytes: result.buffer.length,
+    format: result.mimeType,
   };
 }
 
@@ -1260,205 +1268,55 @@ function isContentBlockedError(
   );
 }
 
-async function rewriteForSafeTTS(
-  text
-) {
-  const prompt = `
-Rewrite the following narration for a general-audience educational YouTube voice-over.
-Keep the factual meaning and topic.
-Use calm, neutral, non-graphic wording.
-Remove or replace sensitive or potentially policy-triggering details.
-Do not add new facts.
-Return ONLY the rewritten narration.
-
-TEXT:
-${text}
-`;
+async function generateTTSWithRetry(text, chunkIndex = 0) {
+  const clean = String(text || "").trim();
+  if (!clean) throw new Error("Empty TTS chunk");
 
   let lastError;
-
-  for (
-    const model of
-      SCRIPT_MODELS.slice(0, 2)
-  ) {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const result =
-        await retryGemini(
-          model,
-          {
-            contents: [
-              {
-                role: "user",
-                parts: [
-                  {
-                    text: prompt,
-                  },
-                ],
-              },
-            ],
-            generationConfig: {
-              temperature: 0.3,
-              maxOutputTokens: 1200,
-            },
-          },
-          30000,
-          2
-        );
-
-      const rewritten =
-        result
-          ?.candidates?.[0]
-          ?.content?.parts
-          ?.map(
-            (part) =>
-              part.text || ""
-          )
-          .join("")
-          .trim();
-
-      if (rewritten) {
-        return rewritten;
-      }
+      const result = await googleCloudTTS(clean);
+      const normalized = await normalizeAudioResult(result);
+      console.log(JSON.stringify({
+        event: "tts_success",
+        provider: "google-cloud",
+        model: result.model,
+        chunk: chunkIndex,
+        attempt,
+      }));
+      return normalized;
     } catch (error) {
-      lastError =
-        error;
+      lastError = error;
+      const status = Number(error.status) || null;
+      const retryable =
+        error.code === "TIMEOUT" ||
+        error.code === "UNAVAILABLE" ||
+        error.code === "DEADLINE_EXCEEDED" ||
+        status === 408 ||
+        status === 425 ||
+        status === 429 ||
+        status >= 500;
 
-      console.log(
-        `Safe TTS rewrite failed: ${error.message}`
+      console.log(JSON.stringify({
+        event: "tts_failure",
+        provider: "google-cloud",
+        chunk: chunkIndex,
+        attempt,
+        code: error.code || null,
+        status,
+        retryable,
+      }));
+
+      if (!retryable || attempt === 3) break;
+      const wait = Math.min(
+        8000,
+        Number(error.retryAfterMs) || 750 * (2 ** (attempt - 1))
       );
+      await sleep(wait + Math.floor(Math.random() * 500));
     }
   }
 
-  throw (
-    lastError ||
-    new Error(
-      "Safe TTS rewrite failed"
-    )
-  );
-}
-
-async function generateTTSWithRetry(
-  text,
-  chunkIndex = 0
-) {
-  let currentText = String(text || "").trim();
-
-  if (!currentText) {
-    throw new Error("Empty TTS chunk");
-  }
-
-  const runProvider = async (provider, model, operation) => {
-    let lastError;
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const result = await operation();
-        const normalized = await normalizeAudioResult(result);
-        console.log(JSON.stringify({
-          event: "tts_success",
-          provider,
-          model,
-          chunk: chunkIndex,
-          attempt,
-        }));
-        return normalized;
-      } catch (error) {
-        lastError = error;
-        const status = Number(error.status) || null;
-        const category = isContentBlockedError(error)
-          ? "content_blocked"
-          : error.code === "TIMEOUT"
-            ? "timeout"
-            : status === 429
-              ? "rate_limit"
-              : status && status >= 500
-                ? "provider_server"
-                : status && status >= 400
-                  ? "provider_client"
-                  : "network";
-
-        console.log(JSON.stringify({
-          event: "tts_failure",
-          provider,
-          model,
-          chunk: chunkIndex,
-          attempt,
-          status,
-          category,
-        }));
-
-        const retryable =
-          error.code !== "CONFIGURATION" &&
-          !isContentBlockedError(error) &&
-          (error.code === "TIMEOUT" ||
-          error.name === "TypeError" ||
-          status === 408 ||
-          status === 425 ||
-          status === 429 ||
-          status >= 500);
-
-        if (!retryable || attempt === 3) break;
-
-        const wait = Math.min(
-          8000,
-          Number(error.retryAfterMs) || 750 * (2 ** (attempt - 1))
-        );
-        await sleep(wait + Math.floor(Math.random() * 500));
-      }
-    }
-
-    throw lastError;
-  };
-
-  let elevenError;
-
-  try {
-    return await runProvider(
-      "elevenlabs",
-      ELEVENLABS_MODEL_ID,
-      () => elevenLabsTTS(currentText)
-    );
-  } catch (error) {
-    elevenError = error;
-  }
-
-  if (isContentBlockedError(elevenError)) {
-    try {
-      currentText = await rewriteForSafeTTS(currentText);
-      return await runProvider(
-        "elevenlabs",
-        ELEVENLABS_MODEL_ID,
-        () => elevenLabsTTS(currentText)
-      );
-    } catch (error) {
-      elevenError = error;
-    }
-  }
-
-  let googleError;
-
-  try {
-    return await runProvider(
-      "google-cloud",
-      isHindiText(currentText) ? GOOGLE_TTS_HI_VOICE_NAME : GOOGLE_TTS_EN_VOICE_NAME,
-      () => googleCloudTTS(currentText)
-    );
-  } catch (error) {
-    googleError = error;
-  }
-
-  if (isContentBlockedError(googleError) && !isContentBlockedError(elevenError)) {
-    currentText = await rewriteForSafeTTS(currentText);
-    return runProvider(
-      "google-cloud",
-      isHindiText(currentText) ? GOOGLE_TTS_HI_VOICE_NAME : GOOGLE_TTS_EN_VOICE_NAME,
-      () => googleCloudTTS(currentText)
-    );
-  }
-
-  throw new Error(
-    `TTS providers exhausted: ElevenLabs ${elevenError?.status || elevenError?.code || "failed"}; Google ${googleError?.status || googleError?.code || "failed"}`
-  );
+  throw lastError;
 }
 
 async function normalizeAudioResult(result) {
@@ -3551,6 +3409,24 @@ app.get(
 async function startup() {
   try {
     await initDatabase();
+
+    const googleConfigured = googleTtsCredentialsConfigured();
+    console.log(
+      `Google Cloud TTS credentials configured: ${googleConfigured ? "yes" : "no"}`
+    );
+
+    if (!googleConfigured) {
+      console.error(
+        "Google Cloud TTS configuration missing. Set GOOGLE_APPLICATION_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS."
+      );
+    }
+
+    if (process.env.GOOGLE_TTS_SMOKE_TEST === "true") {
+      const smoke = await googleTtsSmokeTest();
+      console.log(
+        `Google Cloud TTS smoke test passed: ${smoke.bytes} bytes ${smoke.format}`
+      );
+    }
 
     if (
       WEBHOOK_URL &&

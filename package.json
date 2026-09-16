@@ -7,8 +7,9 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@google-cloud/text-to-speech": "^6.4.1",
     "express": "^5.1.0",
-    "pg": "^8.16.3",
-    "ffmpeg-static": "^5.2.0"
+    "ffmpeg-static": "^5.2.0",
+    "pg": "^8.16.3"
   }
 }
