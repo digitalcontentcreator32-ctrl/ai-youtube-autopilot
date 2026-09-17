@@ -380,6 +380,90 @@ async function telegram(
   return data.result;
 }
 
+async function sendMessage(
+  chatId,
+  text
+) {
+  if (!chatId) return;
+
+  return telegram(
+    "sendMessage",
+    {
+      chat_id: chatId,
+      text,
+      disable_web_page_preview: true,
+    }
+  );
+}
+
+async function sendDocument(
+  chatId,
+  buffer,
+  filename,
+  mimeType,
+  caption = ""
+) {
+  if (!chatId) return;
+
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append(
+    "document",
+    new Blob([buffer], { type: mimeType }),
+    filename
+  );
+
+  if (caption) form.append("caption", caption);
+
+  const response = await fetchWithTimeout(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`,
+    {
+      method: "POST",
+      body: form,
+    },
+    30000
+  );
+  const data = await response.json();
+
+  if (!data.ok) {
+    throw new Error(`Telegram document error: ${JSON.stringify(data)}`);
+  }
+
+  return data.result;
+}
+
+async function sendVideo(
+  chatId,
+  buffer,
+  filename,
+  caption = ""
+) {
+  if (!chatId) return;
+
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append(
+    "video",
+    new Blob([buffer], { type: "video/mp4" }),
+    filename
+  );
+
+  if (caption) form.append("caption", caption);
+
+  const response = await fetchWithTimeout(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo`,
+    { method: "POST", body: form },
+    60000
+  );
+  const data = await response.json();
+
+  if (!data.ok) {
+    throw new Error(`Telegram video error: ${JSON.stringify(data)}`);
+  }
+
+  return data.result;
+}
+
 /*
     ALTER TABLE jobs
     ADD COLUMN IF NOT EXISTS tts_completed_chunks INTEGER DEFAULT 0
